@@ -42,6 +42,8 @@ import (
 )
 
 func main() {
+	fetcher.Logf = log.Printf
+
 	genDir := "public"
 	flag.StringVar(&genDir, "o", genDir, "Output directory for writing updates")
 

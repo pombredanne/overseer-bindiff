@@ -37,7 +37,6 @@ import (
 	"errors"
 	"hash"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -56,6 +55,20 @@ const (
 	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
 	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz"
 )
+
+var (
+	LogPrefix = "[overseer-bindiff] "
+	Logf      = Discardf
+)
+
+func Discardf(pattern string, args ...interface{}) {}
+
+func logf(pattern string, args ...interface{}) {
+	if Logf == nil {
+		return
+	}
+	Logf(LogPrefix+pattern, args...)
+}
 
 // HTTPSelfUpdate is the configuration and runtime data for doing an update.
 //
@@ -99,8 +112,14 @@ func (t *Templates) Init(info, diff, bin string) error {
 	if t.Info, err = template.New("info").Parse(info); err != nil {
 		return errgo.Notef(err, "parse info template %q", info)
 	}
+	if diff == "" {
+		diff = DefaultDiffPath
+	}
 	if t.Diff, err = template.New("diff").Parse(diff); err != nil {
 		return errgo.Notef(err, "parse diff template %q", diff)
+	}
+	if bin == "" {
+		bin = DefaultBinPath
 	}
 	if t.Bin, err = template.New("bin").Parse(bin); err != nil {
 		return errgo.Notef(err, "parse bin template %q", bin)
@@ -159,7 +178,7 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 		defer fh.Close()
 		old = fh
 	} else {
-		log.Printf("cannot open %q: %v", self, err)
+		logf("cannot open %q: %v", self, err)
 	}
 
 	// fetch info
@@ -167,21 +186,33 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 		return nil, err
 	}
 
+	hsh := NewSha()
+	if _, err := io.Copy(hsh, fh); err != nil {
+		return nil, errgo.Notef(err, "read binary %q", fh.Name())
+	}
+	oldSha := hsh.Sum(nil)
+	if bytes.Equal(oldSha, h.Info.Sha256) {
+		return nil, nil
+	}
+	if _, err := fh.Seek(0, 0); err != nil {
+		return nil, errgo.Notef(err, "seek back to the beginning of %q", fh.Name())
+	}
+
 	var bin []byte
 	if old != nil {
-		if bin, err = h.fetchAndVerifyPatch(old); err != nil {
+		if bin, err = h.fetchAndVerifyPatch(old, oldSha); err != nil {
 			bin = nil
 			if err == ErrHashMismatch {
-				log.Println("update: hash mismatch from patched binary")
+				logf("update: hash mismatch from patched binary")
 			}
 		}
 	}
 	if bin == nil {
 		if bin, err = h.fetchAndVerifyFullBin(); err != nil {
 			if err == ErrHashMismatch {
-				log.Println("update: hash mismatch from full binary")
+				logf("update: hash mismatch from full binary")
 			} else {
-				log.Println("update: fetching full binary,", err)
+				logf("update: fetching full binary: %v", err)
 			}
 			return nil, err
 		}
@@ -192,14 +223,14 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 }
 
 func fetch(URL string) (io.ReadCloser, error) {
-	log.Printf("fetch %q", URL)
+	logf("fetch %q", URL)
 	resp, err := http.Get(URL)
 	if err != nil {
 		return nil, errgo.Notef(err, "GET %q", URL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, errgo.Newf("GET failed for %q: %d", resp.StatusCode)
+		return nil, errgo.Newf("GET failed for %q: %d", URL, resp.StatusCode)
 	}
 	return resp.Body, nil
 }
@@ -214,7 +245,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 	case "bin":
 		tpl = h.Templates.Bin
 	default:
-		return "", errors.New("unknown template " + which)
+		return "", errgo.Newf("unknown template %q", which)
 	}
 	var oldShaS, newShaS string
 	if len(oldSha) > 0 {
@@ -223,12 +254,20 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 	if len(newSha) > 0 {
 		newShaS = EncodeSha(newSha)
 	}
-	return h.Templates.Execute(tpl, URLInfo{
+	ui := URLInfo{
 		Platform:   thePlatform,
 		OldSha:     oldShaS,
 		NewSha:     newShaS,
 		BinaryName: filepath.Base(self),
-	})
+	}
+	path, err := h.Templates.Execute(tpl, ui)
+	if err != nil {
+		return "", err
+	}
+	if path == "" {
+		return "", errgo.Newf("empty path from %v", ui)
+	}
+	return path, nil
 }
 
 func (h *HTTPSelfUpdate) fetchInfo() error {
@@ -249,16 +288,17 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	if len(h.Info.Sha256) != sha256.Size {
 		return errgo.New("bad cmd hash in info")
 	}
+	logf("Upstream hash is %q.", EncodeSha(h.Info.Sha256))
 	return nil
 }
 
 var ErrHashMismatch = errors.New("hash mismatch")
 
-func (h *HTTPSelfUpdate) fetchAndVerifyPatch(old io.ReadSeeker) ([]byte, error) {
+func (h *HTTPSelfUpdate) fetchAndVerifyPatch(old io.ReadSeeker, oldSha []byte) ([]byte, error) {
 	if old == nil {
 		return nil, errors.New("empty old")
 	}
-	bin, err := h.fetchAndApplyPatch(old)
+	bin, err := h.fetchAndApplyPatch(old, oldSha)
 	if err != nil {
 		return nil, err
 	}
@@ -268,13 +308,15 @@ func (h *HTTPSelfUpdate) fetchAndVerifyPatch(old io.ReadSeeker) ([]byte, error) 
 	return bin, nil
 }
 
-func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker) ([]byte, error) {
-	cur := GetSha(old)
-	path, err := h.getPath("diff", cur, h.Info.Sha256)
-	if err != nil {
-		return nil, err
+func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker, oldSha []byte) ([]byte, error) {
+	if len(oldSha) != sha256.Size {
+		oldSha = GetSha(old)
+		if _, err := old.Seek(0, 0); err != nil {
+			return nil, err
+		}
 	}
-	if _, err := old.Seek(0, 0); err != nil {
+	path, err := h.getPath("diff", oldSha, h.Info.Sha256)
+	if err != nil {
 		return nil, err
 	}
 	r, err := fetch(h.URL + "/" + path)
