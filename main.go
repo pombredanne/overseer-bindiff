@@ -170,7 +170,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	}
 	infoPath = filepath.Join(genDir, infoPath)
 	log.Printf("Writing info to %q.", infoPath)
-	os.MkdirAll(filepath.Base(infoPath), 0755)
+	os.MkdirAll(filepath.Dir(infoPath), 0755)
 	fh, err = os.Create(infoPath)
 	if err != nil {
 		return errgo.Notef(err, "create %q", infoPath)
