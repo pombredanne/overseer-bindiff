@@ -62,13 +62,12 @@ func main() {
 	flag.StringVar(&diffPath, "diff", fetcher.DefaultDiffPath, "diff path template")
 	flag.StringVar(&binPath, "bin", fetcher.DefaultBinPath, "binary path template")
 
+	flag.Usage = printUsage
 	flag.Parse()
 	var appPath string
 	if flag.NArg() < 1 {
-		var err error
-		if appPath, err = os.Getwd(); err != nil {
-			log.Fatal(err)
-		}
+		printUsage()
+		os.Exit(1)
 	} else {
 		appPath = flag.Arg(0)
 	}
@@ -277,17 +276,6 @@ func printUsage() {
 Positional arguments:
 	Single platform: go-selfupdate myapp
 	Cross platform: go-selfupdate /tmp/mybinares/`)
-}
-
-func generateSha(path string) []byte {
-	fh, err := os.Open(path)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-	s := fetcher.GetSha(fh)
-	fh.Close()
-	return s
 }
 
 func emptyDir(path string) error {
