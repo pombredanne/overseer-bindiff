@@ -52,7 +52,7 @@ import (
 )
 
 const (
-	DefaultInfoPath = "{{.GOOS}}-{{.GOARCH}}.json"
+	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json"
 	DefaultDiffPath = "{{.GOOS}}-{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
 	DefaultBinPath  = "{{.GOOS}}-{{.GOARCH}}/{{.NewSha}}.gz"
 )
@@ -192,6 +192,7 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 }
 
 func fetch(URL string) (io.ReadCloser, error) {
+	log.Printf("fetch %q", URL)
 	resp, err := http.Get(URL)
 	if err != nil {
 		return nil, errgo.Notef(err, "GET %q", URL)
