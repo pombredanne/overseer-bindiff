@@ -53,8 +53,8 @@ import (
 
 const (
 	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json"
-	DefaultDiffPath = "{{.GOOS}}-{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
-	DefaultBinPath  = "{{.GOOS}}-{{.GOARCH}}/{{.NewSha}}.gz"
+	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
+	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz"
 )
 
 // HTTPSelfUpdate is the configuration and runtime data for doing an update.
