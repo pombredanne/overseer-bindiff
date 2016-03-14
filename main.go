@@ -136,7 +136,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	newSha := h.Sum(nil)
 	info := fetcher.URLInfo{
 		Platform: plat,
-		NewSha:   fmt.Sprintf("%x", newSha),
+		NewSha:   fetcher.EncodeSha(newSha),
 	}
 
 	// gzip the binary to its destination

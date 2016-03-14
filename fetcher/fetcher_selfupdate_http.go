@@ -32,9 +32,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"hash"
 	"io"
 	"log"
@@ -217,10 +217,10 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 	}
 	var oldShaS, newShaS string
 	if len(oldSha) > 0 {
-		oldShaS = fmt.Sprintf("%x", oldSha)
+		oldShaS = EncodeSha(oldSha)
 	}
 	if len(newSha) > 0 {
-		newShaS = fmt.Sprintf("%x", newSha)
+		newShaS = EncodeSha(newSha)
 	}
 	return h.Templates.Execute(tpl, URLInfo{
 		Platform:   thePlatform,
@@ -328,6 +328,13 @@ func verifySha(b []byte, sha []byte) bool {
 	h := NewSha()
 	h.Write(b)
 	return bytes.Equal(h.Sum(nil), sha)
+}
+
+func EncodeSha(b []byte) string {
+	return base64.URLEncoding.EncodeToString(b)
+}
+func DecodeSha(s string) ([]byte, error) {
+	return base64.URLEncoding.DecodeString(s)
 }
 
 func GetSha(r io.Reader) []byte {
