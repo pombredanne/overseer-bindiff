@@ -23,8 +23,9 @@
 // Packge fetcher fetches the overseer-bindiff prepared binary diffs or the
 // full binary from the configured URL.
 //
-// Not just the idea, but lot of code is copied from
+// Not just the idea, but a lot of code is copied from
 // https://github.com/sanbornm/go-selfupdate
+// and modified (we don't have version here).
 package fetcher
 
 import (
@@ -38,41 +39,91 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
+	"text/template"
 	"time"
 
 	"github.com/kardianos/osext"
 	"github.com/kr/binarydist"
 )
 
-const plat = runtime.GOOS + "-" + runtime.GOARCH
+const (
+	DefaultInfoPath = "{{.GOOS}}-{{.GOARCH}}.json"
+	DefaultDiffPath = "{{.GOOS}}-{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
+	DefaultBinPath  = "{{.GOOS}}-{{.GOARCH}}/{{.NewSha}}.gz"
+)
 
 // HTTPSelfUpdate is the configuration and runtime data for doing an update.
 //
-// First retrieves the current sha256 of the latest binary from <URL>/<platform>.json
+// First retrieves the current sha256 of the latest binary from <URL>/<InfoPath>
 // such as http://example.com/mybin/linux-amd64.json
 //
-// Then tries the diffs from <URL>/<plat>/<oldsha>/<newsha>
+// Then tries the diffs from <URL>/<DiffPath>
 // for example http://example.com/mybin/linux-amd64/aaa/bbb
 //
-// Then retrieves the full binary from <URL>/<platform>/<current_sha>.gz
+// Then retrieves the full binary from <URL>/<BinPath>
 // for example http://example.com/mybin/linux-amd64/bbb.gz
+//
+// InfoPath, DiffPath and BinPath are treated as text/template templates.
+// Usable fields: GOOS, GOARCH, OldSha, NewSha, BinaryName.
 type HTTPSelfUpdate struct {
-	URL  string // Base URL for API requests
-	Info struct {
-		Sha256 []byte // sha256 of the latest version
-	}
+	URL      string // Base URL for API requests
+	InfoPath string // template for info path, defaults to DefaultInfoPath
+	DiffPath string // template for diff path, defaults to DefaultDiffPath
+	BinPath  string // template for full binary path, defaults to DefaultBinPath
+	Info     Info
 	Interval time.Duration
 
 	//interal state
-	delay bool
-	lasts map[string]string
+	delay                    bool
+	lasts                    map[string]string
+	infoTpl, diffTpl, binTpl *template.Template
+}
+type Info struct {
+	Sha256 []byte // sha256 of the latest version
 }
 
+type Platform struct {
+	GOOS, GOARCH string
+}
+
+var thePlatform = Platform{
+	GOOS:   runtime.GOOS,
+	GOARCH: runtime.GOARCH,
+}
+var self string
+
+type URLInfo struct {
+	Platform
+	OldSha, NewSha, BinaryName string
+}
+
+// Init initializes the templates and returns any error met.
 func (h *HTTPSelfUpdate) Init() error {
 	if h.Interval == 0 {
 		h.Interval = 5 * time.Minute
 	}
+
+	var err error
+	self, err = osext.Executable()
+	if err != nil {
+		return err
+	}
+
+	if h.InfoPath == "" {
+		h.InfoPath = DefaultInfoPath
+	}
+	if h.infoTpl, err = template.New("info").Parse(h.InfoPath); err != nil {
+		return err
+	}
+	if h.diffTpl, err = template.New("diff").Parse(h.DiffPath); err != nil {
+		return err
+	}
+	if h.binTpl, err = template.New("bin").Parse(h.BinPath); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -84,17 +135,12 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 	h.delay = true
 
 	var old io.ReadSeeker
-	path, err := osext.Executable()
-	if err != nil {
-		log.Printf("cannot find executable: %v", err)
+	fh, err := os.Open(self)
+	if err == nil {
+		defer fh.Close()
+		old = fh
 	} else {
-		fh, err := os.Open(path)
-		if err == nil {
-			defer fh.Close()
-			old = fh
-		} else {
-			log.Printf("cannot open %q: %v", path, err)
-		}
+		log.Printf("cannot open %q: %v", self, err)
 	}
 
 	// fetch info
@@ -138,8 +184,41 @@ func fetch(URL string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+func (h HTTPSelfUpdate) GetPath(which string, oldSha, newSha []byte) (string, error) {
+	var tpl *template.Template
+	switch which {
+	case "info":
+		tpl = h.infoTpl
+	case "diff":
+		tpl = h.diffTpl
+	case "bin":
+		tpl = h.binTpl
+	default:
+		return "", errors.New("unknown template " + which)
+	}
+	var oldShaS, newShaS string
+	if len(oldSha) > 0 {
+		oldShaS = fmt.Sprintf("%x", oldSha)
+	}
+	if len(newSha) > 0 {
+		newShaS = fmt.Sprintf("%x", newSha)
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, URLInfo{Platform: thePlatform,
+		OldSha: oldShaS, NewSha: newShaS,
+		BinaryName: filepath.Base(self),
+	}); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
 func (h *HTTPSelfUpdate) fetchInfo() error {
-	r, err := fetch(h.URL + "/" + plat + ".json")
+	path, err := h.GetPath("info", nil, nil)
+	if err != nil {
+		return err
+	}
+	r, err := fetch(h.URL + "/" + path)
 	if err != nil {
 		return err
 	}
@@ -171,11 +250,15 @@ func (h *HTTPSelfUpdate) fetchAndVerifyPatch(old io.ReadSeeker) ([]byte, error) 
 }
 
 func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker) ([]byte, error) {
-	cur := getSha(old)
+	cur := GetSha(old)
+	path, err := h.GetPath("diff", cur, h.Info.Sha256)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := old.Seek(0, 0); err != nil {
 		return nil, err
 	}
-	r, err := fetch(fmt.Sprintf("%s/%s/%x/%x", h.URL, plat, cur, h.Info.Sha256))
+	r, err := fetch(h.URL + "/" + path)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +281,11 @@ func (h *HTTPSelfUpdate) fetchAndVerifyFullBin() ([]byte, error) {
 }
 
 func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
-	r, err := fetch(fmt.Sprintf("%s/%s/%x.gz", h.URL, plat, h.Info.Sha256))
+	path, err := h.GetPath("bin", nil, h.Info.Sha256)
+	if err != nil {
+		return nil, err
+	}
+	r, err := fetch(h.URL + "/" + path)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +308,7 @@ func verifySha(b []byte, sha []byte) bool {
 	return bytes.Equal(h.Sum(nil), sha)
 }
 
-func getSha(r io.Reader) []byte {
+func GetSha(r io.Reader) []byte {
 	h := sha256.New()
 	io.Copy(h, r)
 	return h.Sum(nil)
