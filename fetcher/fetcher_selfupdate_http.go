@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -43,6 +44,8 @@ import (
 	"runtime"
 	"text/template"
 	"time"
+
+	"gopkg.in/errgo.v1"
 
 	"github.com/kardianos/osext"
 	"github.com/kr/binarydist"
@@ -76,12 +79,33 @@ type HTTPSelfUpdate struct {
 	Interval time.Duration
 
 	//interal state
-	delay                    bool
-	lasts                    map[string]string
-	infoTpl, diffTpl, binTpl *template.Template
+	delay     bool
+	lasts     map[string]string
+	Templates Templates
 }
 type Info struct {
 	Sha256 []byte // sha256 of the latest version
+}
+
+type Templates struct {
+	Info, Diff, Bin *template.Template
+}
+
+func (t *Templates) Init(info, diff, bin string) error {
+	if info == "" {
+		info = DefaultInfoPath
+	}
+	var err error
+	if t.Info, err = template.New("info").Parse(info); err != nil {
+		return errgo.Notef(err, "parse info template %q", info)
+	}
+	if t.Diff, err = template.New("diff").Parse(diff); err != nil {
+		return errgo.Notef(err, "parse diff template %q", diff)
+	}
+	if t.Bin, err = template.New("bin").Parse(bin); err != nil {
+		return errgo.Notef(err, "parse bin template %q", bin)
+	}
+	return nil
 }
 
 type Platform struct {
@@ -108,23 +132,18 @@ func (h *HTTPSelfUpdate) Init() error {
 	var err error
 	self, err = osext.Executable()
 	if err != nil {
-		return err
+		return errgo.Notef(err, "find self executable")
 	}
 
-	if h.InfoPath == "" {
-		h.InfoPath = DefaultInfoPath
-	}
-	if h.infoTpl, err = template.New("info").Parse(h.InfoPath); err != nil {
-		return err
-	}
-	if h.diffTpl, err = template.New("diff").Parse(h.DiffPath); err != nil {
-		return err
-	}
-	if h.binTpl, err = template.New("bin").Parse(h.BinPath); err != nil {
-		return err
-	}
+	return h.Templates.Init(h.InfoPath, h.DiffPath, h.BinPath)
+}
 
-	return nil
+func (_ Templates) Execute(tpl *template.Template, info URLInfo) (string, error) {
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, info); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
@@ -175,24 +194,24 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 func fetch(URL string) (io.ReadCloser, error) {
 	resp, err := http.Get(URL)
 	if err != nil {
-		return nil, fmt.Errorf("GET %q: %v", URL, err)
+		return nil, errgo.Notef(err, "GET %q", URL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET failed for %q: %d", resp.StatusCode)
+		return nil, errgo.Newf("GET failed for %q: %d", resp.StatusCode)
 	}
 	return resp.Body, nil
 }
 
-func (h HTTPSelfUpdate) GetPath(which string, oldSha, newSha []byte) (string, error) {
+func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, error) {
 	var tpl *template.Template
 	switch which {
 	case "info":
-		tpl = h.infoTpl
+		tpl = h.Templates.Info
 	case "diff":
-		tpl = h.diffTpl
+		tpl = h.Templates.Diff
 	case "bin":
-		tpl = h.binTpl
+		tpl = h.Templates.Bin
 	default:
 		return "", errors.New("unknown template " + which)
 	}
@@ -203,32 +222,31 @@ func (h HTTPSelfUpdate) GetPath(which string, oldSha, newSha []byte) (string, er
 	if len(newSha) > 0 {
 		newShaS = fmt.Sprintf("%x", newSha)
 	}
-	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, URLInfo{Platform: thePlatform,
-		OldSha: oldShaS, NewSha: newShaS,
+	return h.Templates.Execute(tpl, URLInfo{
+		Platform:   thePlatform,
+		OldSha:     oldShaS,
+		NewSha:     newShaS,
 		BinaryName: filepath.Base(self),
-	}); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	})
 }
 
 func (h *HTTPSelfUpdate) fetchInfo() error {
-	path, err := h.GetPath("info", nil, nil)
+	path, err := h.getPath("info", nil, nil)
 	if err != nil {
-		return err
+		return errgo.Notef(err, "get info path")
 	}
 	r, err := fetch(h.URL + "/" + path)
 	if err != nil {
 		return err
 	}
-	err = json.NewDecoder(r).Decode(&h.Info)
+	var buf bytes.Buffer
+	err = json.NewDecoder(io.TeeReader(r, &buf)).Decode(&h.Info)
 	r.Close()
 	if err != nil {
-		return err
+		return errgo.Notef(err, "decode %q", buf.String())
 	}
 	if len(h.Info.Sha256) != sha256.Size {
-		return errors.New("bad cmd hash in info")
+		return errgo.New("bad cmd hash in info")
 	}
 	return nil
 }
@@ -251,7 +269,7 @@ func (h *HTTPSelfUpdate) fetchAndVerifyPatch(old io.ReadSeeker) ([]byte, error) 
 
 func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker) ([]byte, error) {
 	cur := GetSha(old)
-	path, err := h.GetPath("diff", cur, h.Info.Sha256)
+	path, err := h.getPath("diff", cur, h.Info.Sha256)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +299,7 @@ func (h *HTTPSelfUpdate) fetchAndVerifyFullBin() ([]byte, error) {
 }
 
 func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
-	path, err := h.GetPath("bin", nil, h.Info.Sha256)
+	path, err := h.getPath("bin", nil, h.Info.Sha256)
 	if err != nil {
 		return nil, err
 	}
@@ -302,14 +320,18 @@ func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func NewSha() hash.Hash {
+	return sha256.New()
+}
+
 func verifySha(b []byte, sha []byte) bool {
-	h := sha256.New()
+	h := NewSha()
 	h.Write(b)
 	return bytes.Equal(h.Sum(nil), sha)
 }
 
 func GetSha(r io.Reader) []byte {
-	h := sha256.New()
+	h := NewSha()
 	io.Copy(h, r)
 	return h.Sum(nil)
 }

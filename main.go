@@ -23,7 +23,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"flag"
@@ -35,6 +34,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"gopkg.in/errgo.v1"
 
 	"github.com/kr/binarydist"
 	"github.com/tgulacsi/overseer-bindiff/fetcher"
@@ -56,10 +57,10 @@ func main() {
 		"Target OS. Defaults to running os or the environment variable GOOS.")
 	flag.StringVar(&goarch, "arch", goarch,
 		"Target ARCH. Defaults to running arch or the environment variable GOARCH.")
-	var u fetcher.HTTPSelfUpdate
-	flag.StringVar(&u.InfoPath, "bin", fetcher.DefaultInfoPath, "info path template")
-	flag.StringVar(&u.DiffPath, "bin", fetcher.DefaultDiffPath, "diff path template")
-	flag.StringVar(&u.BinPath, "bin", fetcher.DefaultBinPath, "binary path template")
+	var infoPath, diffPath, binPath string
+	flag.StringVar(&infoPath, "info", fetcher.DefaultInfoPath, "info path template")
+	flag.StringVar(&diffPath, "diff", fetcher.DefaultDiffPath, "diff path template")
+	flag.StringVar(&binPath, "bin", fetcher.DefaultBinPath, "binary path template")
 
 	flag.Parse()
 	var appPath string
@@ -72,7 +73,8 @@ func main() {
 		appPath = flag.Arg(0)
 	}
 
-	if err := u.Init(); err != nil {
+	var tpl fetcher.Templates
+	if err := tpl.Init(infoPath, diffPath, binPath); err != nil {
 		log.Fatal(err)
 	}
 	os.MkdirAll(genDir, 0755)
@@ -84,92 +86,190 @@ func main() {
 	}
 
 	if !fi.IsDir() {
-		if err = createUpdate(genDir, u, appPath, goos, goarch); err != nil {
+		src, err := os.Open(appPath)
+		if err != nil {
+			log.Fatal(errgo.Notef(err, "open %q", appPath))
+		}
+		err = createUpdate(genDir, tpl, src,
+			fetcher.Platform{GOOS: goos, GOARCH: goarch},
+		)
+		src.Close()
+		if err != nil {
 			log.Fatal(err)
 		}
+		return
 	}
 
 	files, err := ioutil.ReadDir(appPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(errgo.Notef(err, "read dir %q", appPath))
 	}
 	for _, file := range files {
+		fn := filepath.Join(appPath, file.Name())
+		src, err := os.Open(fn)
+		if err != nil {
+			log.Println(errgo.Notef(err, "open %q", fn))
+			continue
+		}
 		parts := strings.SplitN(file.Name(), "-", 2)
-		if err := createUpdate(
+		err = createUpdate(
 			genDir,
-			u,
-			filepath.Join(appPath, file.Name()),
-			parts[0], parts[1],
-		); err != nil {
+			tpl,
+			src,
+			fetcher.Platform{GOOS: parts[0], GOARCH: parts[1]},
+		)
+		src.Close()
+		if err != nil {
 			log.Fatal(err)
 		}
 	}
 }
 
-func createUpdate(genDir string, u fetcher.HTTPSelfUpdate, path string, goos, goarch string) error {
-	c := fetcher.Info{Sha256: generateSha(path)}
+func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform) error {
+	// generate the sha256 of the binary
+	h := fetcher.NewSha()
+	if _, err := io.Copy(h, src); err != nil {
+		return errgo.Notef(err, "hash %q", src)
+	}
+	if _, err := src.Seek(0, 0); err != nil {
+		return errgo.Notef(err, "seek back to the beginning of %q", src)
+	}
+	newSha := h.Sum(nil)
+	info := fetcher.URLInfo{
+		Platform: plat,
+		NewSha:   fmt.Sprintf("%x", newSha),
+	}
 
-	fh, err := os.Create(filepath.Join(genDir, h.GetPath("info")), 0755)
+	// gzip the binary to its destination
+	binPath, err := tpl.Execute(tpl.Bin, info)
 	if err != nil {
-		return err
+		return errgo.Notef(err, "execute bin template")
+	}
+	binPath = filepath.Join(genDir, binPath)
+	log.Printf("Writing binary to %q.", binPath)
+	os.MkdirAll(filepath.Dir(binPath), 0755)
+	fh, err := os.Create(binPath)
+	if err != nil {
+		return errgo.Notef(err, "create %q", binPath)
 	}
 	defer fh.Close()
-	if err := json.NewEncoder(fh).Encode(c); err != nil {
-		return err
+	w := gzip.NewWriter(fh)
+	if _, err := io.Copy(w, src); err != nil {
+		return errgo.Notef(err, "gzip %q into %q", src, fh.Name())
 	}
-	return fh.Close()
+	if err := w.Close(); err != nil {
+		return errgo.Notef(err, "flush gzip into %q", fh.Name())
+	}
+	if err := fh.Close(); err != nil {
+		return errgo.Notef(err, "close %q", fh.Name())
+	}
 
-	os.MkdirAll(filepath.Join(genDir, version), 0755)
-
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	f, err := ioutil.ReadFile(path)
+	// write info.json
+	infoPath, err := tpl.Execute(tpl.Info, info)
 	if err != nil {
-		panic(err)
+		return errgo.Notef(err, "execute info template")
 	}
-	w.Write(f)
-	w.Close() // You must close this first to flush the bytes to the buffer.
-	err = ioutil.WriteFile(filepath.Join(genDir, version, platform+".gz"), buf.Bytes(), 0755)
-
-	files, err := ioutil.ReadDir(genDir)
+	infoPath = filepath.Join(genDir, infoPath)
+	log.Printf("Writing info to %q.", infoPath)
+	os.MkdirAll(filepath.Base(infoPath), 0755)
+	fh, err = os.Create(infoPath)
 	if err != nil {
-		fmt.Println(err)
+		return errgo.Notef(err, "create %q", infoPath)
 	}
+	defer fh.Close()
+	if err := json.NewEncoder(fh).Encode(fetcher.Info{Sha256: newSha}); err != nil {
+		return errgo.Notef(err, "encode %v into %q", newSha, fh.Name())
+	}
+	if err := fh.Close(); err != nil {
+		return errgo.Notef(err, "close %q", fh.Name())
+	}
+
+	info.OldSha = oldShaPlaceholder
+	diffPath, err := tpl.Execute(tpl.Diff, info)
+	if err != nil {
+		return errgo.Notef(err, "execute diff template")
+	}
+	return generateDiffs(filepath.Join(genDir, diffPath), binPath)
+}
+
+const oldShaPlaceholder = "{{OLDSHA}}"
+
+// generateDiffs calculates and writes the differences between the current
+// binary and the old binaries, into diffPath.
+//
+// binPath must be the current binary's filename (with full path),
+// and the old binaries are searched in that directory;
+//
+// diffPath should be the full path for the difference between the current
+// binary and the binary named as oldShaPlaceholder.
+func generateDiffs(diffPath, binPath string) error {
+	binDir, currentName := filepath.Split(binPath)
+	files, err := ioutil.ReadDir(binDir)
+	if err != nil {
+		return errgo.Notef(err, "read %q", binDir)
+	}
+	getSha := func(fn string) string {
+		fn = filepath.Base(fn)
+		if ext := filepath.Ext(fn); ext != "" {
+			return fn[:len(fn)-len(ext)]
+		}
+		return fn
+	}
+
+	currentRaw, err := os.Open(binPath)
+	if err != nil {
+		return errgo.Notef(err, "open %q", binPath)
+	}
+	defer currentRaw.Close()
 
 	for _, file := range files {
-		if file.IsDir() == false {
+		if file.IsDir() {
 			continue
 		}
-		if file.Name() == version {
+		if file.Name() == currentName {
 			continue
 		}
+		oldSha := getSha(file.Name())
 
-		os.Mkdir(filepath.Join(genDir, file.Name(), version), 0755)
-
-		fName := filepath.Join(genDir, file.Name(), platform+".gz")
-		old, err := os.Open(fName)
+		fn := filepath.Join(binDir, file.Name())
+		log.Printf("Calculating diff between %q and %q.", fn, binPath)
+		oldRaw, err := os.Open(fn)
 		if err != nil {
-			// Don't have an old release for this os/arch, continue on
+			log.Println(errgo.Notef(err, "open %q", fn))
 			continue
 		}
+		defer oldRaw.Close()
 
-		fName = filepath.Join(genDir, version, platform+".gz")
-		newF, err := os.Open(fName)
+		if _, err = currentRaw.Seek(0, 0); err != nil {
+			return errgo.Notef(err, "seek back to the beginning of %q", currentRaw.Name())
+		}
+		current, err := gzip.NewReader(currentRaw)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Can't open %s: error: %s\n", fName, err)
-			os.Exit(1)
+			return errgo.Notef(err, "gzip decode %q", currentRaw.Name())
 		}
 
-		ar := newGzReader(old)
-		defer ar.Close()
-		br := newGzReader(newF)
-		defer br.Close()
-		patch := new(bytes.Buffer)
-		if err := binarydist.Diff(ar, br, patch); err != nil {
-			panic(err)
+		old, err := gzip.NewReader(oldRaw)
+		if err != nil {
+			log.Println(err)
+			continue
 		}
-		ioutil.WriteFile(filepath.Join(genDir, file.Name(), version, platform), patch.Bytes(), 0755)
+		diffName := strings.Replace(diffPath, oldShaPlaceholder, oldSha, -1)
+		emptyDir(filepath.Dir(diffName))
+		log.Printf("Writing diff to %q.", diffName)
+		os.MkdirAll(filepath.Dir(diffName), 0755)
+		diff, err := os.Create(diffName)
+		if err != nil {
+			return errgo.Notef(err, "create %q", diffName)
+		}
+		if err := binarydist.Diff(old, current, diff); err != nil {
+			return errgo.Notef(err, "calculate binary diffs and write into %q", diff.Name())
+		}
+		if err := diff.Close(); err != nil {
+			return errgo.Notef(err, "close %q", diff.Name())
+		}
+		oldRaw.Close()
 	}
+	return nil
 }
 
 func printUsage() {
@@ -190,26 +290,18 @@ func generateSha(path string) []byte {
 	return s
 }
 
-type gzReader struct {
-	z, r io.ReadCloser
-}
-
-func (g *gzReader) Read(p []byte) (int, error) {
-	return g.z.Read(p)
-}
-
-func (g *gzReader) Close() error {
-	g.z.Close()
-	return g.r.Close()
-}
-
-func newGzReader(r io.ReadCloser) io.ReadCloser {
-	var err error
-	g := new(gzReader)
-	g.r = r
-	g.z, err = gzip.NewReader(r)
+func emptyDir(path string) error {
+	files, err := ioutil.ReadDir(path)
 	if err != nil {
-		panic(err)
+		return errgo.Notef(err, "read dir %q", path)
 	}
-	return g
+	for _, fi := range files {
+		if fi.IsDir() {
+			continue
+		}
+		fn := filepath.Join(path, fi.Name())
+		log.Printf("Deleting %q.", fn)
+		os.Remove(fn)
+	}
+	return nil
 }
