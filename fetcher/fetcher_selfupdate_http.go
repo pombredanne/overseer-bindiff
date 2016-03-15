@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// Packge fetcher fetches the overseer-bindiff prepared binary diffs or the
+// Package fetcher fetches the overseer-bindiff prepared binary diffs or the
 // full binary from the configured URL.
 //
 // Not just the idea, but a lot of code is copied from
