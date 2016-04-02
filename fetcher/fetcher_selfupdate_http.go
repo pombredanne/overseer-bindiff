@@ -44,6 +44,9 @@ import (
 	"text/template"
 	"time"
 
+	"golang.org/x/net/context"
+	"golang.org/x/net/context/ctxhttp"
+
 	"gopkg.in/errgo.v1"
 
 	"github.com/kardianos/osext"
@@ -54,6 +57,10 @@ const (
 	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json"
 	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
 	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz"
+
+	DefaultFetchInfoTimeout  = 10 * time.Second
+	DefaultFetchPatchTimeout = 1 * time.Minute
+	DefaultFetchBinTimeout   = 10 * time.Minute
 )
 
 var (
@@ -90,6 +97,10 @@ type HTTPSelfUpdate struct {
 	BinPath  string // template for full binary path, defaults to DefaultBinPath
 	Info     Info
 	Interval time.Duration
+
+	FetchInfoTimeout  time.Duration
+	FetchPatchTimeout time.Duration
+	FetchBinTimeout   time.Duration
 
 	//interal state
 	delay     bool
@@ -168,6 +179,7 @@ func (_ Templates) Execute(tpl *template.Template, info URLInfo) (string, error)
 func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 	//delay fetches after first
 	if h.delay {
+		logf("sleep %s", h.Interval)
 		time.Sleep(h.Interval)
 	}
 	h.delay = true
@@ -222,16 +234,19 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 	return bytes.NewReader(bin), nil
 }
 
-func fetch(URL string) (io.ReadCloser, error) {
+func fetch(ctx context.Context, URL string) (io.ReadCloser, error) {
 	logf("fetch %q", URL)
-	resp, err := http.Get(URL)
+	resp, err := ctxhttp.Get(ctx, http.DefaultClient, URL)
 	if err != nil {
+		logf("fetch %q: %v", URL, err)
 		return nil, errgo.Notef(err, "GET %q", URL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
+		logf("fetch %q: %v", URL, resp.StatusCode)
 		return nil, errgo.Newf("GET failed for %q: %d", URL, resp.StatusCode)
 	}
+	logf("fetched %q: %v", URL, resp.StatusCode)
 	return resp.Body, nil
 }
 
@@ -275,7 +290,9 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	if err != nil {
 		return errgo.Notef(err, "get info path")
 	}
-	r, err := fetch(h.URL + "/" + path)
+	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchInfoTimeout, DefaultFetchInfoTimeout)
+	defer cancel()
+	r, err := fetch(ctx, h.URL+"/"+path)
 	if err != nil {
 		return err
 	}
@@ -319,7 +336,9 @@ func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker, oldSha []byte) ([
 	if err != nil {
 		return nil, err
 	}
-	r, err := fetch(h.URL + "/" + path)
+	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchPatchTimeout, DefaultFetchPatchTimeout)
+	defer cancel()
+	r, err := fetch(ctx, h.URL+"/"+path)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +365,9 @@ func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := fetch(h.URL + "/" + path)
+	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchBinTimeout, DefaultFetchBinTimeout)
+	defer cancel()
+	r, err := fetch(ctx, h.URL+"/"+path)
 	if err != nil {
 		return nil, err
 	}
@@ -384,4 +405,16 @@ func GetSha(r io.Reader) []byte {
 	h := NewSha()
 	io.Copy(h, r)
 	return h.Sum(nil)
+}
+func getTimeoutCtx(ctx context.Context, d time.Duration, def time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if d < 0 {
+		return ctx, func() {}
+	}
+	if d == 0 {
+		d = def
+	}
+	return context.WithTimeout(ctx, d)
 }
