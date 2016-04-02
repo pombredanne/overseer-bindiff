@@ -41,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"text/template"
 	"time"
 
@@ -90,6 +91,8 @@ func logf(pattern string, args ...interface{}) {
 //
 // InfoPath, DiffPath and BinPath are treated as text/template templates.
 // Usable fields: GOOS, GOARCH, OldSha, NewSha, BinaryName.
+//
+// URLs starting with "file://" are treated as file path, and opened directly with os.Open - mainly for testing.
 type HTTPSelfUpdate struct {
 	URL      string // Base URL for API requests
 	InfoPath string // template for info path, defaults to DefaultInfoPath
@@ -231,11 +234,15 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 	}
 
 	//success!
+	logf("success, binary length=%d", len(bin))
 	return bytes.NewReader(bin), nil
 }
 
 func fetch(ctx context.Context, URL string) (io.ReadCloser, error) {
 	logf("fetch %q", URL)
+	if strings.HasPrefix(URL, "file://") { // great for testing
+		return os.Open(URL[7:])
+	}
 	resp, err := ctxhttp.Get(ctx, http.DefaultClient, URL)
 	if err != nil {
 		logf("fetch %q: %v", URL, err)
