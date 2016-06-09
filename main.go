@@ -35,9 +35,8 @@ import (
 	"runtime"
 	"strings"
 
-	"gopkg.in/errgo.v1"
-
 	"github.com/kr/binarydist"
+	"github.com/pkg/errors"
 	"github.com/tgulacsi/overseer-bindiff/fetcher"
 )
 
@@ -89,7 +88,7 @@ func main() {
 	if !fi.IsDir() {
 		src, err := os.Open(appPath)
 		if err != nil {
-			log.Fatal(errgo.Notef(err, "open %q", appPath))
+			log.Fatal(errors.Wrapf(err, "open %q", appPath))
 		}
 		err = createUpdate(genDir, tpl, src,
 			fetcher.Platform{GOOS: goos, GOARCH: goarch},
@@ -103,13 +102,13 @@ func main() {
 
 	files, err := ioutil.ReadDir(appPath)
 	if err != nil {
-		log.Fatal(errgo.Notef(err, "read dir %q", appPath))
+		log.Fatal(errors.Wrapf(err, "read dir %q", appPath))
 	}
 	for _, file := range files {
 		fn := filepath.Join(appPath, file.Name())
 		src, err := os.Open(fn)
 		if err != nil {
-			log.Println(errgo.Notef(err, "open %q", fn))
+			log.Println(errors.Wrapf(err, "open %q", fn))
 			continue
 		}
 		parts := strings.SplitN(file.Name(), "-", 2)
@@ -130,10 +129,10 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	// generate the sha256 of the binary
 	h := fetcher.NewSha()
 	if _, err := io.Copy(h, src); err != nil {
-		return errgo.Notef(err, "hash %q", src)
+		return errors.Wrapf(err, "hash %q", src)
 	}
 	if _, err := src.Seek(0, 0); err != nil {
-		return errgo.Notef(err, "seek back to the beginning of %q", src)
+		return errors.Wrapf(err, "seek back to the beginning of %q", src)
 	}
 	newSha := h.Sum(nil)
 	info := fetcher.URLInfo{
@@ -144,51 +143,51 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	// gzip the binary to its destination
 	binPath, err := tpl.Execute(tpl.Bin, info)
 	if err != nil {
-		return errgo.Notef(err, "execute bin template")
+		return errors.Wrapf(err, "execute bin template")
 	}
 	binPath = filepath.Join(genDir, binPath)
 	log.Printf("Writing binary to %q.", binPath)
 	os.MkdirAll(filepath.Dir(binPath), 0755)
 	fh, err := os.Create(binPath)
 	if err != nil {
-		return errgo.Notef(err, "create %q", binPath)
+		return errors.Wrapf(err, "create %q", binPath)
 	}
 	defer fh.Close()
 	w := gzip.NewWriter(fh)
 	if _, err := io.Copy(w, src); err != nil {
-		return errgo.Notef(err, "gzip %q into %q", src, fh.Name())
+		return errors.Wrapf(err, "gzip %q into %q", src, fh.Name())
 	}
 	if err := w.Close(); err != nil {
-		return errgo.Notef(err, "flush gzip into %q", fh.Name())
+		return errors.Wrapf(err, "flush gzip into %q", fh.Name())
 	}
 	if err := fh.Close(); err != nil {
-		return errgo.Notef(err, "close %q", fh.Name())
+		return errors.Wrapf(err, "close %q", fh.Name())
 	}
 
 	// write info.json
 	infoPath, err := tpl.Execute(tpl.Info, info)
 	if err != nil {
-		return errgo.Notef(err, "execute info template")
+		return errors.Wrapf(err, "execute info template")
 	}
 	infoPath = filepath.Join(genDir, infoPath)
 	log.Printf("Writing info to %q.", infoPath)
 	os.MkdirAll(filepath.Dir(infoPath), 0755)
 	fh, err = os.Create(infoPath)
 	if err != nil {
-		return errgo.Notef(err, "create %q", infoPath)
+		return errors.Wrapf(err, "create %q", infoPath)
 	}
 	defer fh.Close()
 	if err := json.NewEncoder(fh).Encode(fetcher.Info{Sha256: newSha}); err != nil {
-		return errgo.Notef(err, "encode %v into %q", newSha, fh.Name())
+		return errors.Wrapf(err, "encode %v into %q", newSha, fh.Name())
 	}
 	if err := fh.Close(); err != nil {
-		return errgo.Notef(err, "close %q", fh.Name())
+		return errors.Wrapf(err, "close %q", fh.Name())
 	}
 
 	info.OldSha = oldShaPlaceholder
 	diffPath, err := tpl.Execute(tpl.Diff, info)
 	if err != nil {
-		return errgo.Notef(err, "execute diff template")
+		return errors.Wrapf(err, "execute diff template")
 	}
 	return generateDiffs(filepath.Join(genDir, diffPath), binPath)
 }
@@ -207,7 +206,7 @@ func generateDiffs(diffPath, binPath string) error {
 	binDir, currentName := filepath.Split(binPath)
 	files, err := ioutil.ReadDir(binDir)
 	if err != nil {
-		return errgo.Notef(err, "read %q", binDir)
+		return errors.Wrapf(err, "read %q", binDir)
 	}
 	getSha := func(fn string) string {
 		fn = filepath.Base(fn)
@@ -219,7 +218,7 @@ func generateDiffs(diffPath, binPath string) error {
 
 	currentRaw, err := os.Open(binPath)
 	if err != nil {
-		return errgo.Notef(err, "open %q", binPath)
+		return errors.Wrapf(err, "open %q", binPath)
 	}
 	defer currentRaw.Close()
 
@@ -236,17 +235,17 @@ func generateDiffs(diffPath, binPath string) error {
 		log.Printf("Calculating diff between %q and %q.", fn, binPath)
 		oldRaw, err := os.Open(fn)
 		if err != nil {
-			log.Println(errgo.Notef(err, "open %q", fn))
+			log.Println(errors.Wrapf(err, "open %q", fn))
 			continue
 		}
 		defer oldRaw.Close()
 
 		if _, err = currentRaw.Seek(0, 0); err != nil {
-			return errgo.Notef(err, "seek back to the beginning of %q", currentRaw.Name())
+			return errors.Wrapf(err, "seek back to the beginning of %q", currentRaw.Name())
 		}
 		current, err := gzip.NewReader(currentRaw)
 		if err != nil {
-			return errgo.Notef(err, "gzip decode %q", currentRaw.Name())
+			return errors.Wrapf(err, "gzip decode %q", currentRaw.Name())
 		}
 
 		old, err := gzip.NewReader(oldRaw)
@@ -260,13 +259,13 @@ func generateDiffs(diffPath, binPath string) error {
 		os.MkdirAll(filepath.Dir(diffName), 0755)
 		diff, err := os.Create(diffName)
 		if err != nil {
-			return errgo.Notef(err, "create %q", diffName)
+			return errors.Wrapf(err, "create %q", diffName)
 		}
 		if err := binarydist.Diff(old, current, diff); err != nil {
-			return errgo.Notef(err, "calculate binary diffs and write into %q", diff.Name())
+			return errors.Wrapf(err, "calculate binary diffs and write into %q", diff.Name())
 		}
 		if err := diff.Close(); err != nil {
-			return errgo.Notef(err, "close %q", diff.Name())
+			return errors.Wrapf(err, "close %q", diff.Name())
 		}
 		oldRaw.Close()
 	}
@@ -283,7 +282,7 @@ Positional arguments:
 func emptyDir(path string) error {
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
-		return errgo.Notef(err, "read dir %q", path)
+		return errors.Wrapf(err, "read dir %q", path)
 	}
 	for _, fi := range files {
 		if fi.IsDir() {

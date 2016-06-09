@@ -34,7 +34,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
@@ -48,10 +48,9 @@ import (
 	"golang.org/x/net/context"
 	"golang.org/x/net/context/ctxhttp"
 
-	"gopkg.in/errgo.v1"
-
 	"github.com/kardianos/osext"
 	"github.com/kr/binarydist"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -124,19 +123,19 @@ func (t *Templates) Init(info, diff, bin string) error {
 	}
 	var err error
 	if t.Info, err = template.New("info").Parse(info); err != nil {
-		return errgo.Notef(err, "parse info template %q", info)
+		return errors.Wrapf(err, "parse info template %q", info)
 	}
 	if diff == "" {
 		diff = DefaultDiffPath
 	}
 	if t.Diff, err = template.New("diff").Parse(diff); err != nil {
-		return errgo.Notef(err, "parse diff template %q", diff)
+		return errors.Wrapf(err, "parse diff template %q", diff)
 	}
 	if bin == "" {
 		bin = DefaultBinPath
 	}
 	if t.Bin, err = template.New("bin").Parse(bin); err != nil {
-		return errgo.Notef(err, "parse bin template %q", bin)
+		return errors.Wrapf(err, "parse bin template %q", bin)
 	}
 	return nil
 }
@@ -165,7 +164,7 @@ func (h *HTTPSelfUpdate) Init() error {
 	var err error
 	self, err = osext.Executable()
 	if err != nil {
-		return errgo.Notef(err, "find self executable")
+		return errors.Wrapf(err, "find self executable")
 	}
 
 	return h.Templates.Init(h.InfoPath, h.DiffPath, h.BinPath)
@@ -203,14 +202,14 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 
 	hsh := NewSha()
 	if _, err := io.Copy(hsh, fh); err != nil {
-		return nil, errgo.Notef(err, "read binary %q", fh.Name())
+		return nil, errors.Wrapf(err, "read binary %q", fh.Name())
 	}
 	oldSha := hsh.Sum(nil)
 	if bytes.Equal(oldSha, h.Info.Sha256) {
 		return nil, nil
 	}
 	if _, err := fh.Seek(0, 0); err != nil {
-		return nil, errgo.Notef(err, "seek back to the beginning of %q", fh.Name())
+		return nil, errors.Wrapf(err, "seek back to the beginning of %q", fh.Name())
 	}
 
 	var bin []byte
@@ -246,12 +245,12 @@ func fetch(ctx context.Context, URL string) (io.ReadCloser, error) {
 	resp, err := ctxhttp.Get(ctx, http.DefaultClient, URL)
 	if err != nil {
 		logf("fetch %q: %v", URL, err)
-		return nil, errgo.Notef(err, "GET %q", URL)
+		return nil, errors.Wrapf(err, "GET %q", URL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		logf("fetch %q: %v", URL, resp.StatusCode)
-		return nil, errgo.Newf("GET failed for %q: %d", URL, resp.StatusCode)
+		return nil, errors.New(fmt.Sprintf("GET failed for %q: %d", URL, resp.StatusCode))
 	}
 	logf("fetched %q: %v", URL, resp.StatusCode)
 	return resp.Body, nil
@@ -267,7 +266,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 	case "bin":
 		tpl = h.Templates.Bin
 	default:
-		return "", errgo.Newf("unknown template %q", which)
+		return "", errors.New("unknown template " + which)
 	}
 	var oldShaS, newShaS string
 	if len(oldSha) > 0 {
@@ -287,7 +286,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 		return "", err
 	}
 	if path == "" {
-		return "", errgo.Newf("empty path from %v", ui)
+		return "", errors.New(fmt.Sprintf("empty path from %v", ui))
 	}
 	return path, nil
 }
@@ -295,7 +294,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 func (h *HTTPSelfUpdate) fetchInfo() error {
 	path, err := h.getPath("info", nil, nil)
 	if err != nil {
-		return errgo.Notef(err, "get info path")
+		return errors.Wrapf(err, "get info path")
 	}
 	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchInfoTimeout, DefaultFetchInfoTimeout)
 	defer cancel()
@@ -307,10 +306,10 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	err = json.NewDecoder(io.TeeReader(r, &buf)).Decode(&h.Info)
 	r.Close()
 	if err != nil {
-		return errgo.Notef(err, "decode %q", buf.String())
+		return errors.Wrapf(err, "decode %q", buf.String())
 	}
 	if len(h.Info.Sha256) != sha256.Size {
-		return errgo.New("bad cmd hash in info")
+		return errors.New("bad cmd hash in info")
 	}
 	logf("Upstream hash is %q.", EncodeSha(h.Info.Sha256))
 	return nil
