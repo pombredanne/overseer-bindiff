@@ -31,14 +31,22 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"golang.org/x/crypto/openpgp"
+	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/packet"
+
 	"github.com/kr/binarydist"
 	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
 	"github.com/tgulacsi/overseer-bindiff/fetcher"
 )
+
+const DefaultRSABits = 1024
 
 func main() {
 	fetcher.Logf = log.Printf
@@ -54,75 +62,231 @@ func main() {
 	if goarch == "" {
 		goarch = runtime.GOARCH
 	}
-	flag.StringVar(&goos, "os", goos,
-		"Target OS. Defaults to running os or the environment variable GOOS.")
-	flag.StringVar(&goarch, "arch", goarch,
-		"Target ARCH. Defaults to running arch or the environment variable GOARCH.")
+	cmdMain := &cobra.Command{
+		Use: "main",
+	}
+
 	var infoPath, diffPath, binPath string
-	flag.StringVar(&infoPath, "info", fetcher.DefaultInfoPath, "info path template")
-	flag.StringVar(&diffPath, "diff", fetcher.DefaultDiffPath, "diff path template")
-	flag.StringVar(&binPath, "bin", fetcher.DefaultBinPath, "binary path template")
+	cmdGenerate := &cobra.Command{
+		Use: "generate",
+		Run: func(_ *cobra.Command, args []string) {
+			appPath := os.Args[0]
+			if !filepath.IsAbs(appPath) {
+				if filepath.Base(appPath) == appPath { // search PATH
+					var err error
+					if appPath, err = exec.LookPath(appPath); err != nil {
+						log.Fatal(err)
+					}
+				} else {
+					wd, err := os.Getwd()
+					if err != nil {
+						log.Fatal(err)
+					}
+					appPath = filepath.Clean(filepath.Join(wd, appPath))
+				}
+			}
 
-	flag.Usage = printUsage
-	flag.Parse()
-	var appPath string
-	if flag.NArg() < 1 {
-		printUsage()
-		os.Exit(1)
+			var tpl fetcher.Templates
+			if err := tpl.Init(infoPath, diffPath, binPath); err != nil {
+				log.Fatal(err)
+			}
+			os.MkdirAll(genDir, 0755)
+
+			// If dir is given create update for each file
+			fi, err := os.Stat(appPath)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if !fi.IsDir() {
+				src, err := os.Open(appPath)
+				if err != nil {
+					log.Fatal(errors.Wrapf(err, "open %q", appPath))
+				}
+				err = createUpdate(genDir, tpl, src,
+					fetcher.Platform{GOOS: goos, GOARCH: goarch},
+				)
+				src.Close()
+				if err != nil {
+					log.Fatal(err)
+				}
+				return
+			}
+
+			files, err := ioutil.ReadDir(appPath)
+			if err != nil {
+				log.Fatal(errors.Wrapf(err, "read dir %q", appPath))
+			}
+			for _, file := range files {
+				fn := filepath.Join(appPath, file.Name())
+				src, err := os.Open(fn)
+				if err != nil {
+					log.Println(errors.Wrapf(err, "open %q", fn))
+					continue
+				}
+				parts := strings.SplitN(file.Name(), "-", 2)
+				err = createUpdate(
+					genDir,
+					tpl,
+					src,
+					fetcher.Platform{GOOS: parts[0], GOARCH: parts[1]},
+				)
+				src.Close()
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+		},
+	}
+	F := cmdGenerate.Flags()
+	F.StringVar(&goos, "os", goos,
+		"Target OS. Defaults to running os or the environment variable GOOS.")
+	F.StringVar(&goarch, "arch", goarch,
+		"Target ARCH. Defaults to running arch or the environment variable GOARCH.")
+	F.StringVar(&infoPath, "info", fetcher.DefaultInfoPath, "info path template")
+	F.StringVar(&diffPath, "diff", fetcher.DefaultDiffPath, "diff path template")
+	F.StringVar(&binPath, "bin", fetcher.DefaultBinPath, "binary path template")
+	cmdMain.AddCommand(cmdGenerate)
+
+	{
+		var out string
+		cmdGenKeys := &cobra.Command{
+			Use: "genkeys",
+			Run: func(_ *cobra.Command, args []string) {
+				if len(args) < 2 {
+					fmt.Fprintf(os.Stderr, "Publisher and consumer email addresses is a must!\n")
+					os.Exit(1)
+				}
+				w := io.WriteCloser(os.Stdout)
+				if !(out == "" || out == "-") {
+					var err error
+					if w, err = os.Create(out); err != nil {
+						log.Fatal(err)
+					}
+				}
+				defer func() {
+					if err := w.Close(); err != nil {
+						log.Fatal(err)
+					}
+				}()
+				if err := genAndSer(w, args[0], "Publisher", "overseer-bindiff", ""); err != nil {
+					log.Fatal(err)
+				}
+				if err := genAndSer(w, args[1], "Consumer", "overseer-bindiff", ""); err != nil {
+					log.Fatal(err)
+				}
+			},
+		}
+		cmdGenKeys.Flags().StringVarP(&out, "output", "o", "-", "output file name")
+		cmdMain.AddCommand(cmdGenKeys)
+	}
+
+	cmdPrintKeys := &cobra.Command{
+		Use:     "printkeys",
+		Aliases: []string{"printkey", "key"},
+		Run: func(_ *cobra.Command, args []string) {
+			r := io.ReadCloser(os.Stdin)
+			if len(args) > 0 && args[0] != "" && args[0] != "-" {
+				var err error
+				r, err = os.Open(args[0])
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			defer r.Close()
+			el, err := openpgp.ReadArmoredKeyRing(r)
+			if err != nil {
+				log.Fatal(err)
+			}
+			decIds := make([]uint64, 0, 1)
+			for _, k := range el.DecryptionKeys() {
+				if err := serialize(os.Stdout, k.Entity, openpgp.PrivateKeyType); err != nil {
+					log.Fatal(err)
+				}
+				decIds = append(decIds, k.Entity.PrivateKey.KeyId)
+			}
+			for _, e := range el {
+				var seen bool
+				for _, id := range decIds {
+					if e.PrivateKey.KeyId == id {
+						seen = true
+						break
+					}
+					if seen {
+						break
+					}
+				}
+
+				if err := serialize(os.Stdout, e, openpgp.PublicKeyType); err != nil {
+					log.Fatal(err)
+				}
+			}
+			os.Stdout.Close()
+		},
+	}
+	cmdMain.AddCommand(cmdPrintKeys)
+
+	if _, _, err := cmdMain.Find(os.Args[1:]); err != nil {
+		os.Args = append(append(os.Args[:1], "generate"), os.Args[1:]...)
+	}
+	cmdMain.Execute()
+}
+
+func genAndSer(w io.Writer, nce, defName, defComment, defEmail string) error {
+	name, comment, email := splitNCE(nce, "Publisher", "overseer-bindiff", "")
+	conf := &packet.Config{RSABits: DefaultRSABits}
+	e, err := openpgp.NewEntity(name, comment, email, conf)
+	if err != nil {
+		return errors.Wrapf(err, "NewEntity(%q, %q, %q)", name, comment, email)
+	}
+	for _, blockType := range []string{openpgp.PrivateKeyType, openpgp.PublicKeyType} {
+		if err := serialize(w, e, blockType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func serialize(w io.Writer, e *openpgp.Entity, blockType string) error {
+	wc, err := armor.Encode(w, blockType, nil)
+	if err != nil {
+		return errors.Wrap(err, blockType)
+	}
+	if blockType == openpgp.PrivateKeyType {
+		err = e.SerializePrivate(wc, nil)
 	} else {
-		appPath = flag.Arg(0)
+		err = e.Serialize(wc)
 	}
-
-	var tpl fetcher.Templates
-	if err := tpl.Init(infoPath, diffPath, binPath); err != nil {
-		log.Fatal(err)
+	if closeErr := wc.Close(); closeErr != nil && err == nil {
+		err = closeErr
 	}
-	os.MkdirAll(genDir, 0755)
-
-	// If dir is given create update for each file
-	fi, err := os.Stat(appPath)
 	if err != nil {
-		log.Fatal(err)
+		return errors.Wrap(err, "SerializePrivate")
 	}
+	_, err = w.Write([]byte{'\n'})
+	return err
+}
 
-	if !fi.IsDir() {
-		src, err := os.Open(appPath)
-		if err != nil {
-			log.Fatal(errors.Wrapf(err, "open %q", appPath))
-		}
-		err = createUpdate(genDir, tpl, src,
-			fetcher.Platform{GOOS: goos, GOARCH: goarch},
-		)
-		src.Close()
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
-	files, err := ioutil.ReadDir(appPath)
-	if err != nil {
-		log.Fatal(errors.Wrapf(err, "read dir %q", appPath))
-	}
-	for _, file := range files {
-		fn := filepath.Join(appPath, file.Name())
-		src, err := os.Open(fn)
-		if err != nil {
-			log.Println(errors.Wrapf(err, "open %q", fn))
-			continue
-		}
-		parts := strings.SplitN(file.Name(), "-", 2)
-		err = createUpdate(
-			genDir,
-			tpl,
-			src,
-			fetcher.Platform{GOOS: parts[0], GOARCH: parts[1]},
-		)
-		src.Close()
-		if err != nil {
-			log.Fatal(err)
+func splitNCE(nce, defName, defComment, defEmail string) (name, comment, email string) {
+	nce = strings.TrimSpace(nce)
+	name, comment, email = defName, defComment, defEmail
+	if i := strings.LastIndex(nce, "@"); i >= 0 {
+		if j := strings.LastIndexAny(nce[:i], "< "); j < 0 {
+			return name, comment, nce
+		} else {
+			email, nce = nce[j+1:], strings.TrimSpace(nce[:j])
 		}
 	}
+	if strings.HasSuffix(nce, ")") {
+		if i := strings.LastIndex(nce, "("); i >= 0 {
+			comment, nce = nce[i+1:len(nce)-1], strings.TrimSpace(nce[i:])
+		}
+	}
+	name = nce
+	if name == "" {
+		name = defName
+	}
+	return name, comment, email
 }
 
 func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform) error {
