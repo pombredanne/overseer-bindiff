@@ -23,6 +23,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"flag"
@@ -40,6 +41,7 @@ import (
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
 	"golang.org/x/crypto/openpgp/packet"
+	_ "golang.org/x/crypto/ripemd160"
 
 	"github.com/kr/binarydist"
 	"github.com/pkg/errors"
@@ -47,7 +49,7 @@ import (
 	"github.com/tgulacsi/overseer-bindiff/fetcher"
 )
 
-const DefaultRSABits = 1024
+const DefaultRSABits = 4096
 
 func main() {
 	fetcher.Logf = log.Printf
@@ -261,7 +263,7 @@ func splitNCE(nce, defName, defComment, defEmail string) (name, comment, email s
 	return name, comment, email
 }
 
-func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform, keyring openpgp.KeyRing) error {
+func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform, keyring openpgp.EntityList) error {
 	// generate the sha256 of the binary
 	h := fetcher.NewSha()
 	if _, err := io.Copy(h, src); err != nil {
@@ -284,15 +286,18 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		NewSha:      fetcher.EncodeSha(newSha),
 		IsEncrypted: keyring != nil,
 	}
-	infoNE := info
-	infoNE.IsEncrypted = false
 
 	// gzip the binary to its destination
 	binPath, err := tpl.Execute(tpl.Bin, info)
 	if err != nil {
 		return errors.Wrapf(err, "execute bin template")
 	}
-	binPathNE, _ := tpl.Execute(tpl.Bin, infoNE)
+	binPathNE := binPath
+	if info.IsEncrypted {
+		infoNE := info
+		infoNE.IsEncrypted = false
+		binPathNE, _ = tpl.Execute(tpl.Bin, infoNE)
+	}
 
 	binPath = filepath.Join(genDir, binPath)
 	log.Printf("Writing binary to %q.", binPath)
@@ -304,18 +309,23 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	defer fh.Close()
 	wc := io.WriteCloser(fh)
 	if keyring != nil {
-		if wc, err = openpgp.Encrypt(fh, publicKeys(keyring), signerKey(keyring),
+		if wc, err = openpgp.Encrypt(
+			fh, publicKeys(keyring), signerKey(keyring),
 			&openpgp.FileHints{IsBinary: true, FileName: binPathNE, ModTime: mtime},
-			nil); err != nil {
+			&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
+		); err != nil {
 			return errors.Wrap(err, "Encrypt")
 		}
 	}
-	w := gzip.NewWriter(fh)
+	w := gzip.NewWriter(wc)
 	if _, err := io.Copy(w, src); err != nil {
 		return errors.Wrapf(err, "gzip %q into %q", src, fh.Name())
 	}
 	if err := w.Close(); err != nil {
 		return errors.Wrapf(err, "flush gzip into %q", fh.Name())
+	}
+	if err := wc.Close(); err != nil {
+		return err
 	}
 	if err := fh.Close(); err != nil {
 		return errors.Wrapf(err, "close %q", fh.Name())
@@ -333,12 +343,27 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	if err != nil {
 		return errors.Wrapf(err, "create %q", infoPath)
 	}
-	defer fh.Close()
-	if err := json.NewEncoder(fh).Encode(fetcher.Info{Sha256: newSha}); err != nil {
+	var buf bytes.Buffer
+	err = json.NewEncoder(io.MultiWriter(fh, &buf)).Encode(fetcher.Info{Sha256: newSha})
+	if closeErr := fh.Close(); closeErr != nil && err == nil {
+		err = errors.Wrapf(err, "close %q", fh.Name())
+	}
+	if err != nil {
 		return errors.Wrapf(err, "encode %v into %q", newSha, fh.Name())
 	}
-	if err := fh.Close(); err != nil {
-		return errors.Wrapf(err, "close %q", fh.Name())
+
+	if keyring != nil {
+		fh, err := os.Create(fh.Name() + ".asc")
+		if err != nil {
+			return err
+		}
+		err = openpgp.ArmoredDetachSign(fh, signerKey(keyring), bytes.NewReader(buf.Bytes()), nil)
+		if closeErr := fh.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return err
+		}
 	}
 
 	info.OldSha = oldShaPlaceholder
@@ -346,7 +371,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	if err != nil {
 		return errors.Wrapf(err, "execute diff template")
 	}
-	return generateDiffs(filepath.Join(genDir, diffPath), binPath)
+	return generateDiffs(filepath.Join(genDir, diffPath), binPath, keyring)
 }
 
 const oldShaPlaceholder = "{{OLDSHA}}"
@@ -359,7 +384,7 @@ const oldShaPlaceholder = "{{OLDSHA}}"
 //
 // diffPath should be the full path for the difference between the current
 // binary and the binary named as oldShaPlaceholder.
-func generateDiffs(diffPath, binPath string) error {
+func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
 	binDir, currentName := filepath.Split(binPath)
 	files, err := ioutil.ReadDir(binDir)
 	if err != nil {
@@ -390,43 +415,68 @@ func generateDiffs(diffPath, binPath string) error {
 
 		fn := filepath.Join(binDir, file.Name())
 		log.Printf("Calculating diff between %q and %q.", fn, binPath)
-		oldRaw, err := os.Open(fn)
-		if err != nil {
-			log.Println(errors.Wrapf(err, "open %q", fn))
-			continue
-		}
-		defer oldRaw.Close()
+		diffName := strings.Replace(diffPath, oldShaPlaceholder, oldSha, -1)
 
-		if _, err = currentRaw.Seek(0, 0); err != nil {
-			return errors.Wrapf(err, "seek back to the beginning of %q", currentRaw.Name())
-		}
-		current, err := gzip.NewReader(currentRaw)
-		if err != nil {
-			return errors.Wrapf(err, "gzip decode %q", currentRaw.Name())
-		}
-
-		old, err := gzip.NewReader(oldRaw)
+		old, err := openBin(fn, keyring)
 		if err != nil {
 			log.Println(err)
 			continue
 		}
-		diffName := strings.Replace(diffPath, oldShaPlaceholder, oldSha, -1)
+		cur, err := openBin(binPath, keyring)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		emptyDir(filepath.Dir(diffName))
-		log.Printf("Writing diff to %q.", diffName)
 		os.MkdirAll(filepath.Dir(diffName), 0755)
+
 		diff, err := os.Create(diffName)
 		if err != nil {
+			old.Close()
+			cur.Close()
 			return errors.Wrapf(err, "create %q", diffName)
 		}
-		if err := binarydist.Diff(old, current, diff); err != nil {
+		err = binarydist.Diff(old, cur, diff)
+		old.Close()
+		cur.Close()
+		if err != nil {
 			return errors.Wrapf(err, "calculate binary diffs and write into %q", diff.Name())
 		}
 		if err := diff.Close(); err != nil {
 			return errors.Wrapf(err, "close %q", diff.Name())
 		}
-		oldRaw.Close()
 	}
 	return nil
+}
+
+func openBin(fn string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
+	fh, err := os.Open(fn)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open %q", fn)
+	}
+
+	rc := io.ReadCloser(fh)
+	if keyring != nil {
+		md, err := openpgp.ReadMessage(fh, keyring, fetcher.KeyPrompt, nil)
+		if err != nil {
+			fh.Close()
+			return nil, errors.Wrap(err, "decrypt")
+		}
+		rc = struct {
+			io.Reader
+			io.Closer
+		}{md.UnverifiedBody, fh}
+	}
+
+	gr, err := gzip.NewReader(rc)
+	if err != nil {
+		fh.Close()
+		return nil, errors.Wrapf(err, "gzip decode %q", fn)
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{gr, rc}, nil
 }
 
 func printUsage() {
@@ -480,4 +530,26 @@ func publicKeys(keyring openpgp.EntityList) openpgp.EntityList {
 		}
 	}
 	return pub
+}
+
+func signerKey(el openpgp.EntityList) *openpgp.Entity {
+	decIds := make([]uint64, 0, len(el))
+	for _, k := range el.DecryptionKeys() {
+		decIds = append(decIds, k.Entity.PrivateKey.KeyId)
+	}
+	for _, e := range el {
+		var seen bool
+		for _, id := range decIds {
+			if e.PrivateKey.KeyId == id {
+				seen = true
+				break
+			}
+			if seen {
+				break
+			}
+		}
+
+		return e
+	}
+	return nil
 }

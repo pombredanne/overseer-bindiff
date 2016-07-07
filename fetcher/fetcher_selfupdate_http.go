@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -55,7 +56,7 @@ import (
 )
 
 const (
-	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json{{if .IsEncrypted}}.gpg{{end}}"
+	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json"
 	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}{{if .IsEncrypted}}.gpg{{end}}"
 	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz{{if .IsEncrypted}}.gpg{{end}}"
 
@@ -324,11 +325,26 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	if err != nil {
 		return err
 	}
-	var buf bytes.Buffer
-	err = json.NewDecoder(io.TeeReader(r, &buf)).Decode(&h.Info)
+	b, err := ioutil.ReadAll(r)
 	r.Close()
 	if err != nil {
-		return errors.Wrapf(err, "decode %q", buf.String())
+		return err
+	}
+
+	if h.Keyring != nil {
+		r, err := fetch(ctx, h.URL+"/"+path+".asc", h.Keyring)
+		if err != nil {
+			return err
+		}
+		_, err = openpgp.CheckArmoredDetachedSignature(h.Keyring, bytes.NewReader(b), r)
+		r.Close()
+		if err != nil {
+			return err
+		}
+	}
+	err = json.NewDecoder(bytes.NewReader(b)).Decode(&h.Info)
+	if err != nil {
+		return errors.Wrapf(err, "decode %q", b)
 	}
 	if len(h.Info.Sha256) != sha256.Size {
 		return errors.New("bad cmd hash in info")
