@@ -392,6 +392,9 @@ func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
 	}
 	getSha := func(fn string) string {
 		fn = filepath.Base(fn)
+		if keyring != nil {
+			fn = strings.TrimSuffix(fn, ".gpg")
+		}
 		if ext := filepath.Ext(fn); ext != "" {
 			return fn[:len(fn)-len(ext)]
 		}
