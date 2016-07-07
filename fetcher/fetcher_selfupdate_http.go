@@ -45,6 +45,7 @@ import (
 	"text/template"
 	"time"
 
+	"golang.org/x/crypto/openpgp"
 	"golang.org/x/net/context"
 	"golang.org/x/net/context/ctxhttp"
 
@@ -54,9 +55,9 @@ import (
 )
 
 const (
-	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json"
-	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}"
-	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz"
+	DefaultInfoPath = "{{.GOOS}}_{{.GOARCH}}.json{{if .IsEncrypted}}.gpg{{end}}"
+	DefaultDiffPath = "{{.GOOS}}_{{.GOARCH}}/{{.OldSha}}/{{.NewSha}}{{if .IsEncrypted}}.gpg{{end}}"
+	DefaultBinPath  = "{{.GOOS}}_{{.GOARCH}}/{{.NewSha}}.gz{{if .IsEncrypted}}.gpg{{end}}"
 
 	DefaultFetchInfoTimeout  = 10 * time.Second
 	DefaultFetchPatchTimeout = 1 * time.Minute
@@ -66,6 +67,12 @@ const (
 var (
 	LogPrefix = "[overseer-bindiff] "
 	Logf      = Discardf
+)
+var (
+	ErrNoPassphrase = errors.New("no passphrase for key")
+	KeyPrompt       = func(keys []openpgp.Key, symmetric bool) ([]byte, error) {
+		return nil, ErrNoPassphrase
+	}
 )
 
 func Discardf(pattern string, args ...interface{}) {}
@@ -89,7 +96,7 @@ func logf(pattern string, args ...interface{}) {
 // for example http://example.com/mybin/linux-amd64/bbb.gz
 //
 // InfoPath, DiffPath and BinPath are treated as text/template templates.
-// Usable fields: GOOS, GOARCH, OldSha, NewSha, BinaryName.
+// Usable fields: GOOS, GOARCH, OldSha, NewSha, BinaryName, IsEncrypted.
 //
 // URLs starting with "file://" are treated as file path, and opened directly with os.Open - mainly for testing.
 type HTTPSelfUpdate struct {
@@ -103,6 +110,8 @@ type HTTPSelfUpdate struct {
 	FetchInfoTimeout  time.Duration
 	FetchPatchTimeout time.Duration
 	FetchBinTimeout   time.Duration
+
+	Keyring openpgp.KeyRing // for decrypting encrypted binary
 
 	//interal state
 	delay     bool
@@ -153,6 +162,7 @@ var self string
 type URLInfo struct {
 	Platform
 	OldSha, NewSha, BinaryName string
+	IsEncrypted                bool
 }
 
 // Init initializes the templates and returns any error met.
@@ -237,7 +247,7 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 	return bytes.NewReader(bin), nil
 }
 
-func fetch(ctx context.Context, URL string) (io.ReadCloser, error) {
+func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
 	logf("fetch %q", URL)
 	if strings.HasPrefix(URL, "file://") { // great for testing
 		return os.Open(URL[7:])
@@ -253,6 +263,17 @@ func fetch(ctx context.Context, URL string) (io.ReadCloser, error) {
 		return nil, errors.New(fmt.Sprintf("GET failed for %q: %d", URL, resp.StatusCode))
 	}
 	logf("fetched %q: %v", URL, resp.StatusCode)
+	if keyring != nil {
+		md, err := openpgp.ReadMessage(resp.Body, keyring, KeyPrompt, nil)
+		if err != nil {
+			resp.Body.Close()
+			return nil, errors.Wrap(err, "read pgp message")
+		}
+		return struct {
+			io.Reader
+			io.Closer
+		}{md.UnverifiedBody, resp.Body}, nil
+	}
 	return resp.Body, nil
 }
 
@@ -276,10 +297,11 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 		newShaS = EncodeSha(newSha)
 	}
 	ui := URLInfo{
-		Platform:   thePlatform,
-		OldSha:     oldShaS,
-		NewSha:     newShaS,
-		BinaryName: filepath.Base(self),
+		Platform:    thePlatform,
+		OldSha:      oldShaS,
+		NewSha:      newShaS,
+		BinaryName:  filepath.Base(self),
+		IsEncrypted: h.Keyring != nil,
 	}
 	path, err := h.Templates.Execute(tpl, ui)
 	if err != nil {
@@ -298,7 +320,7 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	}
 	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchInfoTimeout, DefaultFetchInfoTimeout)
 	defer cancel()
-	r, err := fetch(ctx, h.URL+"/"+path)
+	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
 	if err != nil {
 		return err
 	}
@@ -344,7 +366,7 @@ func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker, oldSha []byte) ([
 	}
 	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchPatchTimeout, DefaultFetchPatchTimeout)
 	defer cancel()
-	r, err := fetch(ctx, h.URL+"/"+path)
+	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +395,7 @@ func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
 	}
 	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchBinTimeout, DefaultFetchBinTimeout)
 	defer cancel()
-	r, err := fetch(ctx, h.URL+"/"+path)
+	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
 	if err != nil {
 		return nil, err
 	}

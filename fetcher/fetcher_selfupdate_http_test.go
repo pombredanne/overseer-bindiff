@@ -32,22 +32,23 @@ func TestTemplates(t *testing.T) {
 	info := URLInfo{
 		Platform: Platform{GOOS: "goos", GOARCH: "goarch"},
 		OldSha:   "oldsha", NewSha: "newsha", BinaryName: "Binary",
+		IsEncrypted: true,
 	}
 	if s, err := tpl.Execute(tpl.Info, info); err != nil {
 		t.Fatal(err)
-	} else if await := "goos_goarch.json"; s != await {
+	} else if await := "goos_goarch.json.gpg"; s != await {
 		t.Errorf("info got %q, awaited %q.", s, await)
 	}
 
 	if s, err := tpl.Execute(tpl.Diff, info); err != nil {
 		t.Fatal(err)
-	} else if await := "goos_goarch/oldsha/newsha"; s != await {
+	} else if await := "goos_goarch/oldsha/newsha.gpg"; s != await {
 		t.Errorf("diff got %q, awaited %q.", s, await)
 	}
 
 	if s, err := tpl.Execute(tpl.Bin, info); err != nil {
 		t.Fatal(err)
-	} else if await := "goos_goarch/newsha.gz"; s != await {
+	} else if await := "goos_goarch/newsha.gz.gpg"; s != await {
 		t.Errorf("bin got %q, awaited %q.", s, await)
 	}
 }
