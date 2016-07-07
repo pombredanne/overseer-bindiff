@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
@@ -66,76 +67,46 @@ func main() {
 		Use: "main",
 	}
 
-	var infoPath, diffPath, binPath string
+	var infoPath, diffPath, binPath, keyringPath string
 	cmdGenerate := &cobra.Command{
 		Use: "generate",
 		Run: func(_ *cobra.Command, args []string) {
-			appPath := os.Args[0]
-			if !filepath.IsAbs(appPath) {
-				if filepath.Base(appPath) == appPath { // search PATH
-					var err error
-					if appPath, err = exec.LookPath(appPath); err != nil {
-						log.Fatal(err)
-					}
-				} else {
-					wd, err := os.Getwd()
-					if err != nil {
-						log.Fatal(err)
-					}
-					appPath = filepath.Clean(filepath.Join(wd, appPath))
-				}
+			appPath, err := getAppPath()
+			if err != nil {
+				log.Fatal(err)
 			}
 
+			var keyring openpgp.EntityList
+			if keyringPath != "" {
+				fh, err := os.Open(keyringPath)
+				if err != nil {
+					log.Fatal(err)
+				}
+				keyring, err = openpgp.ReadArmoredKeyRing(fh)
+				fh.Close()
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
 			var tpl fetcher.Templates
 			if err := tpl.Init(infoPath, diffPath, binPath); err != nil {
 				log.Fatal(err)
 			}
 			os.MkdirAll(genDir, 0755)
 
-			// If dir is given create update for each file
-			fi, err := os.Stat(appPath)
+			src, err := os.Open(appPath)
+			if err != nil {
+				log.Fatal(errors.Wrapf(err, "open %q", appPath))
+			}
+			err = createUpdate(genDir, tpl, src,
+				fetcher.Platform{GOOS: goos, GOARCH: goarch},
+				keyring,
+			)
+			src.Close()
 			if err != nil {
 				log.Fatal(err)
 			}
-
-			if !fi.IsDir() {
-				src, err := os.Open(appPath)
-				if err != nil {
-					log.Fatal(errors.Wrapf(err, "open %q", appPath))
-				}
-				err = createUpdate(genDir, tpl, src,
-					fetcher.Platform{GOOS: goos, GOARCH: goarch},
-				)
-				src.Close()
-				if err != nil {
-					log.Fatal(err)
-				}
-				return
-			}
-
-			files, err := ioutil.ReadDir(appPath)
-			if err != nil {
-				log.Fatal(errors.Wrapf(err, "read dir %q", appPath))
-			}
-			for _, file := range files {
-				fn := filepath.Join(appPath, file.Name())
-				src, err := os.Open(fn)
-				if err != nil {
-					log.Println(errors.Wrapf(err, "open %q", fn))
-					continue
-				}
-				parts := strings.SplitN(file.Name(), "-", 2)
-				err = createUpdate(
-					genDir,
-					tpl,
-					src,
-					fetcher.Platform{GOOS: parts[0], GOARCH: parts[1]},
-				)
-				src.Close()
-				if err != nil {
-					log.Fatal(err)
-				}
-			}
+			return
 		},
 	}
 	F := cmdGenerate.Flags()
@@ -146,6 +117,7 @@ func main() {
 	F.StringVar(&infoPath, "info", fetcher.DefaultInfoPath, "info path template")
 	F.StringVar(&diffPath, "diff", fetcher.DefaultDiffPath, "diff path template")
 	F.StringVar(&binPath, "bin", fetcher.DefaultBinPath, "binary path template")
+	F.StringVar(&keyringPath, "keyring", "", "gpg keyring to use")
 	cmdMain.AddCommand(cmdGenerate)
 
 	{
@@ -289,7 +261,7 @@ func splitNCE(nce, defName, defComment, defEmail string) (name, comment, email s
 	return name, comment, email
 }
 
-func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform) error {
+func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat fetcher.Platform, keyring openpgp.KeyRing) error {
 	// generate the sha256 of the binary
 	h := fetcher.NewSha()
 	if _, err := io.Copy(h, src); err != nil {
@@ -298,17 +270,30 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	if _, err := src.Seek(0, 0); err != nil {
 		return errors.Wrapf(err, "seek back to the beginning of %q", src)
 	}
+	var mtime time.Time
+	if str, ok := src.(interface {
+		Stat() (os.FileInfo, error)
+	}); ok {
+		if fi, err := str.Stat(); err == nil {
+			mtime = fi.ModTime()
+		}
+	}
 	newSha := h.Sum(nil)
 	info := fetcher.URLInfo{
-		Platform: plat,
-		NewSha:   fetcher.EncodeSha(newSha),
+		Platform:    plat,
+		NewSha:      fetcher.EncodeSha(newSha),
+		IsEncrypted: keyring != nil,
 	}
+	infoNE := info
+	infoNE.IsEncrypted = false
 
 	// gzip the binary to its destination
 	binPath, err := tpl.Execute(tpl.Bin, info)
 	if err != nil {
 		return errors.Wrapf(err, "execute bin template")
 	}
+	binPathNE, _ := tpl.Execute(tpl.Bin, infoNE)
+
 	binPath = filepath.Join(genDir, binPath)
 	log.Printf("Writing binary to %q.", binPath)
 	os.MkdirAll(filepath.Dir(binPath), 0755)
@@ -317,6 +302,14 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		return errors.Wrapf(err, "create %q", binPath)
 	}
 	defer fh.Close()
+	wc := io.WriteCloser(fh)
+	if keyring != nil {
+		if wc, err = openpgp.Encrypt(fh, publicKeys(keyring), signerKey(keyring),
+			&openpgp.FileHints{IsBinary: true, FileName: binPathNE, ModTime: mtime},
+			nil); err != nil {
+			return errors.Wrap(err, "Encrypt")
+		}
+	}
 	w := gzip.NewWriter(fh)
 	if _, err := io.Copy(w, src); err != nil {
 		return errors.Wrapf(err, "gzip %q into %q", src, fh.Name())
@@ -457,4 +450,34 @@ func emptyDir(path string) error {
 		os.Remove(fn)
 	}
 	return nil
+}
+
+func getAppPath() (string, error) {
+	appPath := os.Args[0]
+	if !filepath.IsAbs(appPath) {
+		if filepath.Base(appPath) == appPath { // search PATH
+			var err error
+			if appPath, err = exec.LookPath(appPath); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			wd, err := os.Getwd()
+			if err != nil {
+				log.Fatal(err)
+			}
+			appPath = filepath.Clean(filepath.Join(wd, appPath))
+		}
+	}
+	_, err := os.Stat(appPath)
+	return appPath, err
+}
+
+func publicKeys(keyring openpgp.EntityList) openpgp.EntityList {
+	pub := make([]*openpgp.Entity, 0, len(keyring))
+	for _, e := range keyring {
+		if e.PrimaryKey != nil {
+			pub = append(pub, e)
+		}
+	}
+	return pub
 }
