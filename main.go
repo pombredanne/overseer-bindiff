@@ -207,7 +207,7 @@ func main() {
 }
 
 func genAndSer(w io.Writer, nce, defName, defComment, defEmail string) error {
-	name, comment, email := splitNCE(nce, "Publisher", "overseer-bindiff", "")
+	name, comment, email := splitNCE(nce, defName, defComment, defEmail)
 	conf := &packet.Config{RSABits: DefaultRSABits}
 	e, err := openpgp.NewEntity(name, comment, email, conf)
 	if err != nil {
@@ -324,8 +324,10 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	if err := w.Close(); err != nil {
 		return errors.Wrapf(err, "flush gzip into %q", fh.Name())
 	}
-	if err := wc.Close(); err != nil {
-		return err
+	if keyring != nil {
+		if err := wc.Close(); err != nil {
+			return err
+		}
 	}
 	if err := fh.Close(); err != nil {
 		return errors.Wrapf(err, "close %q", fh.Name())
@@ -346,7 +348,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	var buf bytes.Buffer
 	err = json.NewEncoder(io.MultiWriter(fh, &buf)).Encode(fetcher.Info{Sha256: newSha})
 	if closeErr := fh.Close(); closeErr != nil && err == nil {
-		err = errors.Wrapf(err, "close %q", fh.Name())
+		err = errors.Wrapf(err, "close info %q", fh.Name())
 	}
 	if err != nil {
 		return errors.Wrapf(err, "encode %v into %q", newSha, fh.Name())
