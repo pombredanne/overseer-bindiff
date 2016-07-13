@@ -155,6 +155,7 @@ func main() {
 		cmdMain.AddCommand(cmdGenKeys)
 	}
 
+	var goOut bool
 	cmdPrintKeys := &cobra.Command{
 		Use:     "printkeys",
 		Aliases: []string{"printkey", "key"},
@@ -171,6 +172,27 @@ func main() {
 			el, err := openpgp.ReadArmoredKeyRing(r)
 			if err != nil {
 				log.Fatal(err)
+			}
+			if goOut {
+				fmt.Printf(`package main
+
+import (
+	"io"
+	"strings"
+
+	"golang.org/x/crypto/openpgp"
+)
+
+// readKeyring reads the keyring, and panics on error
+func readKeyring(r io.Reader) openpgp.KeyRing {
+    keyring, err := openpgp.ReadArmoredKeyRing(r)
+    if err != nil {
+        panic(err)
+    }
+    return keyring
+}
+
+var keyring = readKeyring(strings.NewReader(` + "`")
 			}
 			decIds := make([]uint64, 0, 1)
 			for _, k := range el.DecryptionKeys() {
@@ -195,9 +217,13 @@ func main() {
 					log.Fatal(err)
 				}
 			}
+			if goOut {
+				fmt.Printf("`))\n")
+			}
 			os.Stdout.Close()
 		},
 	}
+	cmdPrintKeys.Flags().BoolVar(&goOut, "go-out", false, "go output, not just the armored keyring")
 	cmdMain.AddCommand(cmdPrintKeys)
 
 	if _, _, err := cmdMain.Find(os.Args[1:]); err != nil {
