@@ -73,7 +73,7 @@ func main() {
 	cmdGenerate := &cobra.Command{
 		Use: "generate",
 		Run: func(_ *cobra.Command, args []string) {
-			appPath, err := getAppPath()
+			appPath, err := getAppPath(args[0])
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -535,8 +535,7 @@ func emptyDir(path string) error {
 	return nil
 }
 
-func getAppPath() (string, error) {
-	appPath := os.Args[0]
+func getAppPath(appPath string) (string, error) {
 	if !filepath.IsAbs(appPath) {
 		if filepath.Base(appPath) == appPath { // search PATH
 			var err error
