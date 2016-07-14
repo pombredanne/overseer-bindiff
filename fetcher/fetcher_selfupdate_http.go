@@ -264,7 +264,7 @@ func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadClo
 		return nil, errors.New(fmt.Sprintf("GET failed for %q: %d", URL, resp.StatusCode))
 	}
 	logf("fetched %q: %v", URL, resp.StatusCode)
-	if len(keyring.DecryptionKeys()) > 0 {
+	if HasKeys(keyring) {
 		md, err := openpgp.ReadMessage(resp.Body, keyring, KeyPrompt, nil)
 		if err != nil {
 			resp.Body.Close()
@@ -302,7 +302,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 		OldSha:      oldShaS,
 		NewSha:      newShaS,
 		BinaryName:  filepath.Base(self),
-		IsEncrypted: len(h.Keyring.DecryptionKeys()) > 0,
+		IsEncrypted: HasKeys(h.Keyring),
 	}
 	path, err := h.Templates.Execute(tpl, ui)
 	if err != nil {
@@ -321,7 +321,7 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 	}
 	ctx, cancel := getTimeoutCtx(context.Background(), h.FetchInfoTimeout, DefaultFetchInfoTimeout)
 	defer cancel()
-	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
+	r, err := fetch(ctx, h.URL+"/"+path, nil)
 	if err != nil {
 		return err
 	}
@@ -331,15 +331,15 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 		return err
 	}
 
-	if len(h.Keyring.DecryptionKeys()) > 0 {
-		r, err := fetch(ctx, h.URL+"/"+path+".asc", h.Keyring)
+	if HasKeys(h.Keyring) {
+		r, err := fetch(ctx, h.URL+"/"+path+".asc", nil)
 		if err != nil {
 			return err
 		}
 		_, err = openpgp.CheckArmoredDetachedSignature(h.Keyring, bytes.NewReader(b), r)
 		r.Close()
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "check %q with %v", b, h.Keyring)
 		}
 	}
 	err = json.NewDecoder(bytes.NewReader(b)).Decode(&h.Info)

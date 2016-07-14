@@ -42,7 +42,7 @@ func TestEncryptDecrypt(t *testing.T) {
 	}
 	var cipherBuf bytes.Buffer
 	wc, err := openpgp.Encrypt(
-		&cipherBuf, publicKeys(keyring), signerKey(keyring),
+		&cipherBuf, fetcher.PublicKeys(keyring), fetcher.SignerKey(keyring),
 		&openpgp.FileHints{IsBinary: true, FileName: "test", ModTime: time.Now()},
 		&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
 	)

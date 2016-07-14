@@ -336,7 +336,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	wc := io.WriteCloser(fh)
 	if keyring != nil {
 		if wc, err = openpgp.Encrypt(
-			fh, publicKeys(keyring), signerKey(keyring),
+			fh, fetcher.PublicKeys(keyring), fetcher.SignerKey(keyring),
 			&openpgp.FileHints{IsBinary: true, FileName: binPathNE, ModTime: mtime},
 			&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
 		); err != nil {
@@ -385,7 +385,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		if err != nil {
 			return err
 		}
-		err = openpgp.ArmoredDetachSign(fh, signerKey(keyring), bytes.NewReader(buf.Bytes()), nil)
+		err = openpgp.ArmoredDetachSign(fh, fetcher.SignerKey(keyring), bytes.NewReader(buf.Bytes()), nil)
 		if closeErr := fh.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
@@ -413,7 +413,7 @@ const oldShaPlaceholder = "{{OLDSHA}}"
 // diffPath should be the full path for the difference between the current
 // binary and the binary named as oldShaPlaceholder.
 func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
-	hasKeyring := len(keyring.DecryptionKeys()) > 0
+	hasKeyring := fetcher.HasKeys(keyring)
 	binDir, currentName := filepath.Split(binPath)
 	files, err := ioutil.ReadDir(binDir)
 	if err != nil {
@@ -482,7 +482,7 @@ func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
 }
 
 func openBin(fn string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
-	hasKeyring := len(keyring.DecryptionKeys()) > 0
+	hasKeyring := fetcher.HasKeys(keyring)
 	fh, err := os.Open(fn)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open %q", fn)
@@ -552,36 +552,4 @@ func getAppPath(appPath string) (string, error) {
 	}
 	_, err := os.Stat(appPath)
 	return appPath, err
-}
-
-func publicKeys(keyring openpgp.EntityList) openpgp.EntityList {
-	pub := make([]*openpgp.Entity, 0, len(keyring))
-	for _, e := range keyring {
-		if e.PrimaryKey != nil {
-			pub = append(pub, e)
-		}
-	}
-	return pub
-}
-
-func signerKey(el openpgp.EntityList) *openpgp.Entity {
-	decIds := make([]uint64, 0, len(el))
-	for _, k := range el.DecryptionKeys() {
-		decIds = append(decIds, k.Entity.PrivateKey.KeyId)
-	}
-	for _, e := range el {
-		var seen bool
-		for _, id := range decIds {
-			if e.PrivateKey.KeyId == id {
-				seen = true
-				break
-			}
-			if seen {
-				break
-			}
-		}
-
-		return e
-	}
-	return nil
 }

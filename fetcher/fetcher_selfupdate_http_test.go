@@ -22,7 +22,18 @@
 
 package fetcher
 
-import "testing"
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/openpgp"
+)
 
 func TestTemplates(t *testing.T) {
 	tpl := Templates{}
@@ -36,7 +47,7 @@ func TestTemplates(t *testing.T) {
 	}
 	if s, err := tpl.Execute(tpl.Info, info); err != nil {
 		t.Fatal(err)
-	} else if await := "goos_goarch.json.gpg"; s != await {
+	} else if await := "goos_goarch.json"; s != await {
 		t.Errorf("info got %q, awaited %q.", s, await)
 	}
 
@@ -51,4 +62,49 @@ func TestTemplates(t *testing.T) {
 	} else if await := "goos_goarch/newsha.gz.gpg"; s != await {
 		t.Errorf("bin got %q, awaited %q.", s, await)
 	}
+}
+
+func TestFetchInfo(t *testing.T) {
+	Logf = func(prefix string, keyvals ...interface{}) {
+		t.Logf(prefix, keyvals...)
+	}
+	if !HasKeys(testKeyring) {
+		t.Fatal("keyring is empty!")
+	}
+	server := httptest.NewServer(testHandler(t))
+	defer server.Close()
+	su := &HTTPSelfUpdate{
+		URL:      server.URL,
+		InfoPath: "info.json",
+		DiffPath: "diff",
+		BinPath:  "bin.gz",
+		Keyring:  testKeyring,
+	}
+	su.Init()
+
+	if err := su.fetchInfo(); err != nil {
+		t.Errorf("%+v", err)
+	}
+}
+
+func testHandler(t *testing.T) http.Handler {
+	const bin = `This is NOT a binary!`
+	sha := sha256.New()
+	io.WriteString(sha, bin)
+	infoJSON := `{"Sha256":"` + base64.StdEncoding.EncodeToString(sha.Sum(nil)) + `"}`
+	var buf bytes.Buffer
+	if err := openpgp.ArmoredDetachSign(&buf, SignerKey(testKeyring), strings.NewReader(infoJSON), nil); err != nil {
+		panic(err)
+	}
+	infoJSONAsc := buf.String()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/info.json":
+			io.WriteString(w, infoJSON)
+		case "/info.json.asc":
+			io.WriteString(w, infoJSONAsc)
+		default:
+			http.Error(w, r.URL.Path+" NOT FOUND", http.StatusNotFound)
+		}
+	})
 }
