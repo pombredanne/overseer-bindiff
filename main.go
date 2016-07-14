@@ -413,6 +413,7 @@ const oldShaPlaceholder = "{{OLDSHA}}"
 // diffPath should be the full path for the difference between the current
 // binary and the binary named as oldShaPlaceholder.
 func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
+	hasKeyring := len(keyring.DecryptionKeys()) > 0
 	binDir, currentName := filepath.Split(binPath)
 	files, err := ioutil.ReadDir(binDir)
 	if err != nil {
@@ -420,7 +421,7 @@ func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
 	}
 	getSha := func(fn string) string {
 		fn = filepath.Base(fn)
-		if keyring != nil {
+		if hasKeyring {
 			fn = strings.TrimSuffix(fn, ".gpg")
 		}
 		if ext := filepath.Ext(fn); ext != "" {
@@ -481,13 +482,14 @@ func generateDiffs(diffPath, binPath string, keyring openpgp.KeyRing) error {
 }
 
 func openBin(fn string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
+	hasKeyring := len(keyring.DecryptionKeys()) > 0
 	fh, err := os.Open(fn)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open %q", fn)
 	}
 
 	rc := io.ReadCloser(fh)
-	if keyring != nil {
+	if hasKeyring {
 		md, err := openpgp.ReadMessage(fh, keyring, fetcher.KeyPrompt, nil)
 		if err != nil {
 			fh.Close()

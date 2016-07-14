@@ -264,7 +264,7 @@ func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadClo
 		return nil, errors.New(fmt.Sprintf("GET failed for %q: %d", URL, resp.StatusCode))
 	}
 	logf("fetched %q: %v", URL, resp.StatusCode)
-	if keyring != nil {
+	if len(keyring.DecryptionKeys()) > 0 {
 		md, err := openpgp.ReadMessage(resp.Body, keyring, KeyPrompt, nil)
 		if err != nil {
 			resp.Body.Close()
@@ -302,7 +302,7 @@ func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, er
 		OldSha:      oldShaS,
 		NewSha:      newShaS,
 		BinaryName:  filepath.Base(self),
-		IsEncrypted: h.Keyring != nil,
+		IsEncrypted: len(h.Keyring.DecryptionKeys()) > 0,
 	}
 	path, err := h.Templates.Execute(tpl, ui)
 	if err != nil {
@@ -331,7 +331,7 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 		return err
 	}
 
-	if h.Keyring != nil {
+	if len(h.Keyring.DecryptionKeys()) > 0 {
 		r, err := fetch(ctx, h.URL+"/"+path+".asc", h.Keyring)
 		if err != nil {
 			return err
