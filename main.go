@@ -227,7 +227,7 @@ var keyring = readKeyring(strings.NewReader(` + "`")
 	cmdMain.AddCommand(cmdPrintKeys)
 
 	if _, _, err := cmdMain.Find(os.Args[1:]); err != nil {
-		os.Args = append(append(os.Args[:1], "generate"), os.Args[1:]...)
+		os.Args = append(append(make([]string, 0, len(os.Args)+1), os.Args[0], "generate"), os.Args[1:]...)
 	}
 	cmdMain.Execute()
 }
