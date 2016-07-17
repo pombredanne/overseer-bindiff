@@ -128,7 +128,7 @@ func main() {
 			Use: "genkeys",
 			Run: func(_ *cobra.Command, args []string) {
 				if len(args) < 2 {
-					fmt.Fprintf(os.Stderr, "Publisher and consumer email addresses is a must!\n")
+					fmt.Fprintf(os.Stderr, "Producer and consumer email addresses is a must!\n")
 					os.Exit(1)
 				}
 				w := io.WriteCloser(os.Stdout)
@@ -143,7 +143,7 @@ func main() {
 						log.Fatal(err)
 					}
 				}()
-				if err := genAndSer(w, args[0], "Publisher", "overseer-bindiff", ""); err != nil {
+				if err := genAndSer(w, args[0], "Producer", "overseer-bindiff", ""); err != nil {
 					log.Fatal(err)
 				}
 				if err := genAndSer(w, args[1], "Consumer", "overseer-bindiff", ""); err != nil {
@@ -192,14 +192,28 @@ import (
 
 // readKeyring reads the keyring, and panics on error
 func readKeyring(r io.Reader) openpgp.KeyRing {
-    keyring, err := openpgp.ReadArmoredKeyRing(r)
-    if err != nil {
-        panic(err)
-    }
+	var keyring openpgp.EntityList
+	for {
+		el, err := openpgp.ReadArmoredKeyRing(r)
+		if err != nil {
+			if len(keyring) == 0 {
+				panic(err)
+			}
+			break
+		}
+		keyring = append(keyring, el...)
+	}
     return keyring
 }
 
-var keyring = readKeyring(strings.NewReader(` + "`")
+var keyring = readKeyring(strings.NewReader(
+` + "`")
+			}
+			// Print all publick keys.
+			for _, e := range el {
+				if err := serialize(os.Stdout, e, openpgp.PublicKeyType); err != nil {
+					log.Fatal(err)
+				}
 			}
 			// Search for the consumer's private key
 			for _, k := range el.DecryptionKeys() {
@@ -213,22 +227,6 @@ var keyring = readKeyring(strings.NewReader(` + "`")
 					continue
 				}
 				if err := serialize(os.Stdout, k.Entity, openpgp.PrivateKeyType); err != nil {
-					log.Fatal(err)
-				}
-				break
-			}
-			// Search for the publisher's public key
-			for _, e := range el {
-				var isPublisher bool
-				for nm := range e.Identities {
-					if isPublisher = strings.Contains(strings.ToLower(nm), "publisher"); isPublisher {
-						break
-					}
-				}
-				if !isPublisher {
-					continue
-				}
-				if err := serialize(os.Stdout, e, openpgp.PublicKeyType); err != nil {
 					log.Fatal(err)
 				}
 				break
@@ -264,7 +262,8 @@ func genAndSer(w io.Writer, nce, defName, defComment, defEmail string) error {
 }
 
 func serialize(w io.Writer, e *openpgp.Entity, blockType string) error {
-	wc, err := armor.Encode(w, blockType, nil)
+	var buf bytes.Buffer
+	wc, err := armor.Encode(&buf, blockType, nil)
 	if err != nil {
 		return errors.Wrap(err, blockType)
 	}
@@ -279,7 +278,20 @@ func serialize(w io.Writer, e *openpgp.Entity, blockType string) error {
 	if err != nil {
 		return errors.Wrap(err, "SerializePrivate")
 	}
-	_, err = w.Write([]byte{'\n'})
+	if _, err = w.Write([]byte{'\n'}); err != nil {
+		return err
+	}
+	b := buf.Bytes()
+	i := bytes.Index(b, []byte("-----\n")) + 6
+	var nm string
+	for k := range e.Identities {
+		nm = k
+		break
+	}
+	_, err = io.Copy(w,
+		io.MultiReader(bytes.NewReader(b[:i]),
+			strings.NewReader("Name: "+nm+"\n"),
+			bytes.NewReader(b[i:])))
 	return err
 }
 
@@ -352,7 +364,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	wc := io.WriteCloser(fh)
 	if keyring != nil {
 		if wc, err = openpgp.Encrypt(
-			fh, fetcher.PublicKeys(keyring), fetcher.SignerKey(keyring),
+			fh, keyring, fetcher.SignerKey(keyring),
 			&openpgp.FileHints{IsBinary: true, FileName: binPathNE, ModTime: mtime},
 			&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
 		); err != nil {
@@ -388,7 +400,8 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		return errors.Wrapf(err, "create %q", infoPath)
 	}
 	var buf bytes.Buffer
-	err = json.NewEncoder(io.MultiWriter(fh, &buf)).Encode(fetcher.Info{Sha256: newSha})
+	err = json.NewEncoder(io.MultiWriter(fh, &buf)).
+		Encode(fetcher.Info{Sha256: newSha})
 	if closeErr := fh.Close(); closeErr != nil && err == nil {
 		err = errors.Wrapf(err, "close info %q", fh.Name())
 	}
@@ -401,7 +414,10 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		if err != nil {
 			return err
 		}
-		err = openpgp.ArmoredDetachSign(fh, fetcher.SignerKey(keyring), bytes.NewReader(buf.Bytes()), nil)
+		log.Printf("Signing %q", buf.String())
+		err = openpgp.ArmoredDetachSign(fh,
+			fetcher.SignerKey(keyring),
+			bytes.NewReader(buf.Bytes()), nil)
 		if closeErr := fh.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}

@@ -22,7 +22,11 @@
 
 package fetcher
 
-import "golang.org/x/crypto/openpgp"
+import (
+	"strings"
+
+	"golang.org/x/crypto/openpgp"
+)
 
 // HasKeys iff not nil and has decryption keys.
 func HasKeys(keyring openpgp.KeyRing) bool {
@@ -31,34 +35,12 @@ func HasKeys(keyring openpgp.KeyRing) bool {
 
 // SignerKey returns the key usable for signing from the keyring.
 func SignerKey(el openpgp.EntityList) *openpgp.Entity {
-	decIds := make([]uint64, 0, len(el))
-	for _, k := range el.DecryptionKeys() {
-		decIds = append(decIds, k.Entity.PrivateKey.KeyId)
-	}
 	for _, e := range el {
-		var seen bool
-		for _, id := range decIds {
-			if e.PrivateKey.KeyId == id {
-				seen = true
-				break
-			}
-			if seen {
-				break
+		for nm := range e.Identities {
+			if strings.Contains(strings.ToLower(nm), "producer") {
+				return e
 			}
 		}
-
-		return e
 	}
 	return nil
-}
-
-// PublicKeys returns the public keys from the keyring.
-func PublicKeys(keyring openpgp.EntityList) openpgp.EntityList {
-	pub := make([]*openpgp.Entity, 0, len(keyring))
-	for _, e := range keyring {
-		if e.PrimaryKey != nil {
-			pub = append(pub, e)
-		}
-	}
-	return pub
 }

@@ -339,7 +339,10 @@ func (h *HTTPSelfUpdate) fetchInfo() error {
 		_, err = openpgp.CheckArmoredDetachedSignature(h.Keyring, bytes.NewReader(b), r)
 		r.Close()
 		if err != nil {
-			return errors.Wrapf(err, "check %q with %v", b, h.Keyring)
+			for _, e := range h.Keyring.(openpgp.EntityList) {
+				logf("%q", e.Identities)
+			}
+			return errors.Wrapf(err, "check %q with %q", b, h.Keyring)
 		}
 	}
 	err = json.NewDecoder(bytes.NewReader(b)).Decode(&h.Info)
