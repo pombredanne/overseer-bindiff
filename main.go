@@ -169,9 +169,16 @@ func main() {
 				}
 			}
 			defer r.Close()
-			el, err := openpgp.ReadArmoredKeyRing(r)
-			if err != nil {
-				log.Fatal(err)
+			var el openpgp.EntityList
+			for {
+				els, err := openpgp.ReadArmoredKeyRing(r)
+				el = append(el, els...)
+				if err != nil {
+					if len(el) == 0 {
+						log.Fatal(err)
+					}
+					break
+				}
 			}
 			if goOut {
 				fmt.Printf(`package main
@@ -194,28 +201,37 @@ func readKeyring(r io.Reader) openpgp.KeyRing {
 
 var keyring = readKeyring(strings.NewReader(` + "`")
 			}
-			decIds := make([]uint64, 0, 1)
+			// Search for the consumer's private key
 			for _, k := range el.DecryptionKeys() {
+				var isConsumer bool
+				for nm := range k.Entity.Identities {
+					if isConsumer = strings.Contains(strings.ToLower(nm), "consumer"); isConsumer {
+						break
+					}
+				}
+				if !isConsumer {
+					continue
+				}
 				if err := serialize(os.Stdout, k.Entity, openpgp.PrivateKeyType); err != nil {
 					log.Fatal(err)
 				}
-				decIds = append(decIds, k.Entity.PrivateKey.KeyId)
+				break
 			}
+			// Search for the publisher's public key
 			for _, e := range el {
-				var seen bool
-				for _, id := range decIds {
-					if e.PrivateKey.KeyId == id {
-						seen = true
-						break
-					}
-					if seen {
+				var isPublisher bool
+				for nm := range e.Identities {
+					if isPublisher = strings.Contains(strings.ToLower(nm), "publisher"); isPublisher {
 						break
 					}
 				}
-
+				if !isPublisher {
+					continue
+				}
 				if err := serialize(os.Stdout, e, openpgp.PublicKeyType); err != nil {
 					log.Fatal(err)
 				}
+				break
 			}
 			if goOut {
 				fmt.Printf("`))\n")
