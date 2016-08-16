@@ -31,6 +31,7 @@ package fetcher
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -47,8 +48,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/openpgp"
-	"golang.org/x/net/context"
-	"golang.org/x/net/context/ctxhttp"
 
 	"github.com/kardianos/osext"
 	"github.com/kr/binarydist"
@@ -253,7 +252,12 @@ func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadClo
 	if strings.HasPrefix(URL, "file://") { // great for testing
 		return os.Open(URL[7:])
 	}
-	resp, err := ctxhttp.Get(ctx, http.DefaultClient, URL)
+	req, err := http.NewRequest("GET", URL, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "NewRequest(%q)", URL)
+	}
+	req = req.WithContext(ctx)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		logf("fetch %q: %v", URL, err)
 		return nil, errors.Wrapf(err, "GET %q", URL)
