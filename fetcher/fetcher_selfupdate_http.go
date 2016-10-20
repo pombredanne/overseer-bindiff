@@ -202,7 +202,7 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 		defer fh.Close()
 		old = fh
 	} else {
-		logf("cannot open %q: %v", self, err)
+		logf("cannot open %q: %+v", self, err)
 	}
 
 	// fetch info
@@ -228,6 +228,8 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 			bin = nil
 			if err == ErrHashMismatch {
 				logf("update: hash mismatch from patched binary")
+			} else {
+				logf("update: fetching patch: %+v", err)
 			}
 		}
 	}
@@ -236,7 +238,7 @@ func (h *HTTPSelfUpdate) Fetch() (io.Reader, error) {
 			if err == ErrHashMismatch {
 				logf("update: hash mismatch from full binary")
 			} else {
-				logf("update: fetching full binary: %v", err)
+				logf("update: fetching full binary: %+v", err)
 			}
 			return nil, err
 		}
@@ -259,7 +261,7 @@ func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadClo
 	req = req.WithContext(ctx)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		logf("fetch %q: %v", URL, err)
+		logf("fetch %q: %+v", URL, err)
 		return nil, errors.Wrapf(err, "GET %q", URL)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -268,18 +270,24 @@ func fetch(ctx context.Context, URL string, keyring openpgp.KeyRing) (io.ReadClo
 		return nil, errors.New(fmt.Sprintf("GET failed for %q: %d", URL, resp.StatusCode))
 	}
 	logf("fetched %q: %v", URL, resp.StatusCode)
-	if HasKeys(keyring) {
-		md, err := openpgp.ReadMessage(resp.Body, keyring, KeyPrompt, nil)
-		if err != nil {
-			resp.Body.Close()
-			return nil, errors.Wrap(err, "read pgp message")
-		}
-		return struct {
-			io.Reader
-			io.Closer
-		}{md.UnverifiedBody, resp.Body}, nil
+	if !HasKeys(keyring) {
+		return resp.Body, nil
 	}
-	return resp.Body, nil
+	md, err := openpgp.ReadMessage(resp.Body, keyring, KeyPrompt, nil)
+	if err != nil {
+		resp.Body.Close()
+		logf("read %q with keyring %v: %+v", URL, keyring, err)
+		return nil, errors.Wrapf(err, "read pgp message with %v", keyring)
+	}
+	var part [1024]byte
+	n, err := io.ReadAtLeast(md.UnverifiedBody, part[:], cap(part)/2)
+	return struct {
+		io.Reader
+		io.Closer
+	}{
+		io.MultiReader(bytes.NewReader(part[:n]), md.UnverifiedBody),
+		resp.Body,
+	}, errors.Wrapf(err, "read UnverifiedBody with %v", keyring)
 }
 
 func (h HTTPSelfUpdate) getPath(which string, oldSha, newSha []byte) (string, error) {
@@ -391,18 +399,18 @@ func (h *HTTPSelfUpdate) fetchAndApplyPatch(old io.ReadSeeker, oldSha []byte) ([
 	defer cancel()
 	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "fetchAndVerifyPatch")
 	}
 	defer r.Close()
 	var buf bytes.Buffer
 	err = binarydist.Patch(old, &buf, r)
-	return buf.Bytes(), err
+	return buf.Bytes(), errors.Wrap(err, "apply patch")
 }
 
 func (h *HTTPSelfUpdate) fetchAndVerifyFullBin() ([]byte, error) {
 	bin, err := h.fetchBin()
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "fetchAndVerifyFullBin")
 	}
 	verified := verifySha(bin, h.Info.Sha256)
 	if !verified {
@@ -420,19 +428,15 @@ func (h *HTTPSelfUpdate) fetchBin() ([]byte, error) {
 	defer cancel()
 	r, err := fetch(ctx, h.URL+"/"+path, h.Keyring)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "fetchBin")
 	}
 	defer r.Close()
-	buf := new(bytes.Buffer)
 	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "gzip")
 	}
-	if _, err = io.Copy(buf, gz); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	b, err := ioutil.ReadAll(gz)
+	return b, errors.Wrap(err, "read gzip")
 }
 
 func NewSha() hash.Hash {
