@@ -246,9 +246,12 @@ var keyring = readKeyring(strings.NewReader(
 	cmdMain.Execute()
 }
 
-func genAndSer(w io.Writer, nce, defName, defComment, defEmail string) error {
+func genAndSer(w io.Writer, nce, defName, defComment, defEmail string, confs ...PackConf) error {
 	name, comment, email := splitNCE(nce, defName, defComment, defEmail)
 	conf := &packet.Config{RSABits: DefaultRSABits}
+	for _, f := range confs {
+		f(conf)
+	}
 	e, err := openpgp.NewEntity(name, comment, email, conf)
 	if err != nil {
 		return errors.Wrapf(err, "NewEntity(%q, %q, %q)", name, comment, email)
@@ -259,6 +262,15 @@ func genAndSer(w io.Writer, nce, defName, defComment, defEmail string) error {
 		}
 	}
 	return nil
+}
+
+type PackConf func(*packet.Config)
+
+func WithRSABits(bits int) func(c *packet.Config) {
+	if bits == 0 {
+		bits = DefaultRSABits
+	}
+	return func(c *packet.Config) { c.RSABits = bits }
 }
 
 func serialize(w io.Writer, e *openpgp.Entity, blockType string) error {
@@ -363,11 +375,7 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 	defer fh.Close()
 	wc := io.WriteCloser(fh)
 	if keyring != nil {
-		if wc, err = openpgp.Encrypt(
-			fh, keyring, fetcher.SignerKey(keyring),
-			&openpgp.FileHints{IsBinary: true, FileName: binPathNE, ModTime: mtime},
-			&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
-		); err != nil {
+		if wc, err = encrypt(fh, binPathNE, mtime, keyring); err != nil {
 			return errors.Wrap(err, "Encrypt")
 		}
 	}
@@ -432,6 +440,15 @@ func createUpdate(genDir string, tpl fetcher.Templates, src io.ReadSeeker, plat 
 		return errors.Wrapf(err, "execute diff template")
 	}
 	return generateDiffs(filepath.Join(genDir, diffPath), binPath, keyring)
+}
+
+func encrypt(w io.Writer, fn string, mtime time.Time, keyring openpgp.EntityList) (io.WriteCloser, error) {
+	wc, err := openpgp.Encrypt(
+		w, keyring, fetcher.SignerKey(keyring),
+		&openpgp.FileHints{IsBinary: true, FileName: fn, ModTime: mtime},
+		&packet.Config{DefaultCompressionAlgo: 0, RSABits: DefaultRSABits},
+	)
+	return wc, errors.Wrap(err, "Encrypt")
 }
 
 const oldShaPlaceholder = "{{OLDSHA}}"
@@ -522,15 +539,15 @@ func openBin(fn string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
 
 	rc := io.ReadCloser(fh)
 	if hasKeyring {
-		md, err := openpgp.ReadMessage(fh, keyring, fetcher.KeyPrompt, nil)
+		r, err := decrypt(rc, keyring)
 		if err != nil {
 			fh.Close()
-			return nil, errors.Wrap(err, "decrypt")
+			return nil, err
 		}
-		rc = struct {
+		return struct {
 			io.Reader
 			io.Closer
-		}{md.UnverifiedBody, fh}
+		}{r, fh}, nil
 	}
 
 	gr, err := gzip.NewReader(rc)
@@ -542,6 +559,14 @@ func openBin(fn string, keyring openpgp.KeyRing) (io.ReadCloser, error) {
 		io.Reader
 		io.Closer
 	}{gr, rc}, nil
+}
+
+func decrypt(r io.Reader, keyring openpgp.KeyRing) (io.Reader, error) {
+	md, err := openpgp.ReadMessage(r, keyring, fetcher.KeyPrompt, nil)
+	if err != nil {
+		return r, errors.Wrap(err, "decrypt")
+	}
+	return md.UnverifiedBody, nil
 }
 
 func printUsage() {
